@@ -9,10 +9,15 @@ environment:
 hooks:
   user_defines:
     thermion_dart:
-      mode: release
+      mode: debug
 
 dependencies:
-  thermion_dart: ^0.3.4+1
+  thermion_dart:
+    git:
+      url: https://github.com/nmfisher/thermion.git
+      ref: develop
+      path: thermion_dart
+  sdl3: ^2.8.5
   vector_math: ^2.1.0
 
 dev_dependencies:

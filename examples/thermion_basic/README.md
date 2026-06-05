@@ -1,45 +1,54 @@
 # thermion_basic
 
-Vanilla Thermion bootstrap on top of the Flutter Zero Dart runtime — no UI
-layer, no animation. Renders a magenta background to a BMP file.
+Vanilla Thermion bootstrap into an SDL3 window — no UI layer yet. Opens
+an 800×600 window, hands the backing `CAMetalLayer` to Filament, renders
+a Catppuccin-flavoured background continuously. Escape or closing the
+window quits.
 
-This is the smallest possible "Thermion runs inside Flutter Zero" demo,
-modeled after Thermion's own `examples/dart/cli_headless`. It confirms:
+This validates three things:
 
-1. `FFIFilamentApp.create()` succeeds under the Flutter Zero bundled Dart
-   SDK
-2. The native-assets hook for `thermion_dart` builds and links
-3. A headless swapchain + view round-trips one frame's pixels back to Dart
+1. The Filament Metal backend bootstraps against an externally-owned
+   `CAMetalLayer` (SDL3 owns the layer, Filament owns the swapchain).
+2. `registerRequestFrameHook` actually fires per frame on the Dart
+   thread.
+3. SDL3 event polling coexists with Filament's render thread (Thermion
+   spawns its own native render thread; our SDL polling runs on the
+   Dart main thread inside the frame hook).
 
-It does **not** integrate with the workspace pubspec — the workspace's
-pinned `archive` / `code_assets` / `hooks` versions conflict with
-`thermion_dart`'s requirements, so this example resolves its own deps via
-its own `pubspec.yaml`. Future Thermion work lives alongside, not inside,
-the existing `_flutter_packages` workspace.
+It's the windowed peer of Thermion's own `examples/dart/cli_headless` —
+the latter writes a frame to a BMP file, this one shows it in a window.
+
+## macOS only for now
+
+This example targets macOS. Filament's other backends (Vulkan on
+Linux/Windows, OpenGL on web) need different surface-acquisition glue
+than `CAMetalLayer`. Cross-platform support is a follow-up.
 
 ## Requirements
 
-- The Flutter Zero bundled Dart SDK (or any Dart `>= 3.11.0`).
-  Native-assets is on by default — no experiment flag needed on Dart
-  3.5+.
-- A C/C++ toolchain (Thermion's build hook compiles FFI glue locally
-  and links against a precompiled Filament archive it downloads from
-  Cloudflare R2).
+- macOS (arm64 or x86_64)
+- Flutter Zero's bundled Dart SDK (Dart 3.13.0-beta).
+- SDL3 installed via Homebrew:
+  ```sh
+  brew install sdl3
+  ```
 
-## Platform / build-mode matrix
+## Dependencies
 
-Thermion ships precompiled Filament binaries; not every (platform, mode)
-combo is published. As of `thermion_dart 0.3.4+1` / Filament v1.58.0:
+This example sits outside the Flutter Zero workspace because Thermion's
+`archive` / `code_assets` / `hooks` requirements conflict with the
+workspace's pinned versions. It resolves its own deps via its own
+`pubspec.yaml`:
 
-| Platform        | Debug | Release |
-| --------------- | :---: | :-----: |
-| macOS (arm64)   | ✓     | ✓       |
-| Linux (x86_64)  | ✗     | ✓       |
-| Windows (x86_64)| ✗     | ✗       |
+- `thermion_dart` from the `develop` branch of
+  [nmfisher/thermion](https://github.com/nmfisher/thermion). Pub.dev
+  currently has 0.3.4+1, but the windowed-swapchain API surface this
+  example uses lives on develop / 0.4.0.
+- `sdl3 ^2.8.5` for window and event handling.
 
-This example pins `mode: release` in `pubspec.yaml` so it works on both
-macOS and Linux. Flip to `mode: debug` in `hooks.user_defines.thermion_dart`
-if you want debug symbols and you're on a supported platform.
+The `pubspec.yaml` pins `hooks.user_defines.thermion_dart.mode: debug`,
+which matches the precompiled Filament binaries Thermion downloads from
+its CDN for macOS.
 
 ## Running
 
@@ -49,43 +58,37 @@ cd examples/thermion_basic
 ../../bin/dart run lib/main.dart
 ```
 
-This example is **not** a workspace member (Thermion's `archive` /
-`code_assets` / `hooks` requirements diverge from the Flutter Zero
-workspace pins), so use plain `dart pub get` and run from the example
-directory.
+Expected behaviour: an 800×600 window opens, draws a dark
+Catppuccin-Mocha background, prints `frame 60`, `frame 120`, … every
+~1s. Escape or closing the window prints `Shutting down...` and exits.
 
-Output lands in `examples/thermion_basic/output/render.bmp` — a 500×500
-magenta bitmap.
+## Implementation notes
 
-## Verified on this branch
-
-Bootstrap output on Linux x86_64 (Ubuntu 24.04 inside a container,
-software Vulkan):
-
-```
-FEngine (64 bits) created at 0x... (threading is enabled)
-FEngine resolved backend: Vulkan
-Vulkan device driver: llvmpipe Mesa 25.2.8-0ubuntu0.24.04.1 (LLVM 20.1.2)
-Selected physical device 'llvmpipe (LLVM 20.1.2, 128 bits)' ...
-Backend feature level: 3
-FEngine feature level: 1
-No material provider specified, using default ubershader provider
-FilamentApp ready.
-Viewer ready.
-Capturing one frame...
-Wrote output/render.bmp (750054 bytes).
-Destroying RenderThread (0 tasks remaining)
-```
-
-Filament's render thread is created (confirms our audit's "Thermion has
-its own native render thread" finding) and tears down cleanly via
-`Isolate.kill`.
+- **Metal layer plumbing.** The `sdl3 2.8.5` package's Dart bindings for
+  `SDL_Metal_CreateView` / `SDL_Metal_GetLayer` have broken signatures
+  (return `Void`, drop their `view` argument). We work around this by
+  looking up both symbols directly via `DynamicLibrary.open(...)` and
+  calling them with the correct C signatures. Worth filing upstream.
+- **Frame hook.** We register an async callback via
+  `FilamentApp.instance!.registerRequestFrameHook(...)`. Thermion's
+  render thread calls into it on the Dart main thread once per frame,
+  before the GPU submission. We use it to drain SDL events.
+- **Quit.** A `Completer<void>` gets completed when SDL surfaces a
+  quit event or Escape, the outer `await` returns, and the cleanup
+  path runs in order: stop rendering → unregister hook → dispose
+  viewer → destroy FilamentApp → destroy SDL view + window → quit SDL.
+- **No UI layer.** Intentionally. The `FrameScheduler` /
+  `RecordingCanvas` / widget-tree work from `UI_BRAINSTORMING.md` and
+  `RENDERING.md` will plug in above this baseline once the bootstrap
+  is solid.
 
 ## Next steps
 
-- Continuous rendering via `viewer.setRendering(true)`
-- A native window swapchain (instead of headless) — needs platform
-  native-handle plumbing
-- Register a `requestFrameHook` to validate the integration point for
-  our future UI scheduler
-- Load a glTF asset so the scene has actual 3D content
+- Drop a glTF asset into the scene to confirm the full render pipeline
+  works (load with `viewer.loadGltf(...)`).
+- Implement a `ThermionFrameScheduler` that satisfies our framework's
+  `FrameScheduler` interface and wraps `registerRequestFrameHook`.
+- A second `View` attached to the same SwapChain at `renderOrder: 1`
+  for UI overlay.
+- Linux (Vulkan via `wl_egl_window`/`xlib`) and Windows (D3D12) variants
+  once the macOS path is solid.
