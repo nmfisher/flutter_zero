@@ -1,6 +1,7 @@
 // ignore_for_file: avoid_print
 
 import 'dart:ffi';
+import 'dart:io' show File, Platform;
 import 'dart:math';
 
 import 'package:sdl3/sdl3.dart';
@@ -9,6 +10,8 @@ const _width = 800;
 const _height = 600;
 
 void main() {
+  _registerSdlLibrary();
+
   if (!sdlInit(SDL_INIT_VIDEO)) {
     print('Failed to initialize SDL: ${sdlGetError()}');
     return;
@@ -131,4 +134,23 @@ void main() {
   sdlQuit();
 
   print('SDL3 cleaned up. Goodbye!');
+}
+
+// dlopen's default search path on macOS includes /usr/local/lib (Intel
+// Homebrew) but NOT /opt/homebrew/lib (Apple Silicon Homebrew). When the
+// example runs inside a Flutter .app bundle, DYLD_LIBRARY_PATH is also
+// usually stripped by SIP — so probe known install locations and pin an
+// absolute path on SdlDynamicLibraryService before sdlInit.
+void _registerSdlLibrary() {
+  if (!Platform.isMacOS) return;
+  const candidates = [
+    '/opt/homebrew/lib/libSDL3.dylib',
+    '/usr/local/lib/libSDL3.dylib',
+  ];
+  for (final path in candidates) {
+    if (File(path).existsSync()) {
+      SdlDynamicLibraryService().set('sdl', path);
+      return;
+    }
+  }
 }

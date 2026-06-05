@@ -69,12 +69,22 @@ cd examples/sdl_window
 ```
 
 Homebrew installs `libSDL3.dylib` to `/opt/homebrew/lib` (Apple Silicon)
-or `/usr/local/lib` (Intel). The `sdl3` package finds it automatically.
-If it doesn't, load it explicitly before `sdlInit`:
+or `/usr/local/lib` (Intel). `dlopen`'s default search path on macOS
+includes the Intel location but **not** `/opt/homebrew/lib` — and inside
+a Flutter `.app` bundle `DYLD_LIBRARY_PATH` is usually stripped by SIP,
+so env-var workarounds don't help. `main()` calls a small
+`_registerSdlLibrary()` helper that probes both Homebrew paths and pins
+the absolute path on `SdlDynamicLibraryService` before `sdlInit`.
+
+If you install SDL3 somewhere unusual, extend that helper or pass your
+path directly:
 
 ```dart
-SdlDynamicLibraryService().set('SDL3', '/opt/homebrew/lib/libSDL3.dylib');
+SdlDynamicLibraryService().set('sdl', '/your/path/libSDL3.dylib');
 ```
+
+(Note the key is `'sdl'` lowercase — that's the entry the `sdl3` package
+uses internally, not the file basename `SDL3`.)
 
 ### Linux
 
