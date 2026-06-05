@@ -6,6 +6,7 @@ environment:
 workspace:
   - examples/hello_world
   - examples/sdl_window
+  - examples/sdl_ui
 
 dependencies:
   _discoveryapis_commons: 1.0.7

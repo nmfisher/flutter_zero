@@ -1,0 +1,15 @@
+name: sdl_ui
+description: "Flutter Zero example: foundation for a UI framework on top of SDL3."
+publish_to: 'none'
+version: 0.1.0+1
+
+resolution: workspace
+
+environment:
+  sdk: ^3.11.0-169.0.dev
+
+dependencies:
+  sdl3: ^2.8.5
+
+dev_dependencies:
+  lints: ^6.0.0
