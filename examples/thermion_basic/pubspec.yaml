@@ -1,0 +1,19 @@
+name: thermion_basic
+description: "Flutter Zero example: vanilla Thermion bootstrap (no UI layer yet)."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.0-0
+
+hooks:
+  user_defines:
+    thermion_dart:
+      mode: release
+
+dependencies:
+  thermion_dart: ^0.3.4+1
+  vector_math: ^2.1.0
+
+dev_dependencies:
+  lints: ^6.0.0
