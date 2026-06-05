@@ -1,0 +1,20 @@
+name: sdl_window
+description: "Flutter Zero example: SDL3 window with rendering and input."
+publish_to: 'none'
+version: 0.1.0+1
+
+resolution: workspace
+
+environment:
+  sdk: ^3.11.0-169.0.dev
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sdl3: ^2.8.5
+
+dev_dependencies:
+#  flutter_test:
+#    sdk: flutter
+  flutter_lints: ^6.0.0
+
