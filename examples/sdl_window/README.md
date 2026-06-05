@@ -86,6 +86,14 @@ SdlDynamicLibraryService().set('sdl', '/your/path/libSDL3.dylib');
 (Note the key is `'sdl'` lowercase — that's the entry the `sdl3` package
 uses internally, not the file basename `SDL3`.)
 
+**App sandbox.** `macos/Runner/DebugProfile.entitlements` has
+`com.apple.security.app-sandbox = false` — without that, the macOS app
+sandbox blocks `dlopen()` from reaching `/opt/homebrew/lib` (you'll see
+`file system sandbox blocked open()`). `Release.entitlements` still has
+the sandbox enabled, so for distribution you'd need to bundle
+`libSDL3.dylib` into `Contents/Frameworks/` instead of dlopen-ing from
+the system path.
+
 ### Linux
 
 Ubuntu 24.04 ships SDL2 only. Build SDL3 from source:
