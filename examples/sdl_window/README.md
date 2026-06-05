@@ -15,6 +15,48 @@ loads `libSDL3` via `dart:ffi` at runtime — there is no fallback. The
 example will fail to create a window with `Failed to create window: ...`
 if the library can't be found.
 
+## First-time setup: patch the Flutter SDK version stamp
+
+The Flutter Zero repo isn't tagged, so on a fresh clone `git describe`
+returns nothing and the bundled SDK reports its framework version as
+`0.0.0-unknown`. `pub` rejects that when resolving any workspace package
+with a Flutter SDK constraint (e.g. `scoped_model`), producing:
+
+```
+The current Flutter SDK version is 0.0.0-unknown.
+Because _flutter_packages depends on scoped_model 2.0.0 which requires
+Flutter SDK version >=1.24.0-1.0.pre, version solving failed.
+```
+
+Trigger the bootstrap once so `bin/cache/flutter.version.json` exists,
+then patch the version string to something `pub` will accept:
+
+```sh
+# trigger SDK bootstrap (downloads Dart + engine artifacts the first time)
+../../bin/flutter --version >/dev/null 2>&1
+```
+
+Then, depending on your shell:
+
+```sh
+# macOS
+sed -i '' 's/0\.0\.0-unknown/3.99.0/g' ../../bin/cache/flutter.version.json
+
+# Linux
+sed -i 's/0\.0\.0-unknown/3.99.0/g' ../../bin/cache/flutter.version.json
+```
+
+```powershell
+# Windows (PowerShell)
+(Get-Content ..\..\bin\cache\flutter.version.json) `
+  -replace '0\.0\.0-unknown', '3.99.0' `
+  | Set-Content ..\..\bin\cache\flutter.version.json
+```
+
+`bin/cache/` is gitignored, so the edit stays purely local — it won't
+show up in `git status`. Redo this if anything invalidates the cache
+(e.g. after `flutter upgrade` against this repo).
+
 ## Running
 
 ### macOS
@@ -22,7 +64,8 @@ if the library can't be found.
 ```sh
 brew install sdl3
 cd examples/sdl_window
-../../bin/dart run lib/main.dart
+../../bin/flutter pub get        # resolve workspace deps (uses the bundled SDK)
+../../bin/dart lib/main.dart
 ```
 
 Homebrew installs `libSDL3.dylib` to `/opt/homebrew/lib` (Apple Silicon)
@@ -46,13 +89,14 @@ Then:
 
 ```sh
 cd examples/sdl_window
-../../bin/dart run lib/main.dart
+../../bin/flutter pub get
+../../bin/dart lib/main.dart
 ```
 
 Headless / CI works under Xvfb:
 
 ```sh
-xvfb-run -s "-screen 0 800x600x24" ../../bin/dart run lib/main.dart
+xvfb-run -s "-screen 0 800x600x24" ../../bin/dart lib/main.dart
 ```
 
 ### Windows
@@ -62,7 +106,8 @@ and place it next to the Dart executable or somewhere on `%PATH%`. Then:
 
 ```sh
 cd examples\sdl_window
-..\..\bin\dart run lib\main.dart
+..\..\bin\flutter pub get
+..\..\bin\dart lib\main.dart
 ```
 
 ## Controls
