@@ -33,7 +33,9 @@ The library must be discoverable at runtime (on the system library path, or load
 
 ### Dart SDK
 
-Flutter Zero pins to a dev-channel Dart SDK (`^3.11.0-169.0.dev`). The `sdl3` package requires Dart `>=3.11`, which is compatible.
+Workspace members in this repo pin a dev-channel Dart SDK (`^3.11.0-169.0.dev`), which is compatible with `sdl3`'s `>=3.11` requirement.
+
+> **Heads up:** the *root* `pubspec.yaml` currently pins `sdk: ^3.9.0-0`. If you add `sdl3` to the root `dependencies:` block (see Step 4), you'll also need to raise the root SDK constraint to `^3.11.0-0` (or similar), otherwise `pub get` will fail at the root level.
 
 ## Implementation Steps
 
@@ -49,17 +51,19 @@ The hello_world example already has the correct Flutter Zero platform scaffoldin
 
 ### Step 2: Rename References
 
-Update all platform build files from `hello_world` to `sdl_window`. Files that need updating:
+Update all platform build files from `hello_world` to `sdl_window`. The files in `examples/hello_world/` that actually contain `hello_world` references (verified):
 
 | Platform | Files |
 |---|---|
-| **Root** | `pubspec.yaml` (name), `.metadata`, `README.md` |
-| **Android** | `android/app/build.gradle.kts` (namespace, applicationId), `android/app/src/main/kotlin/...` (package dir), `AndroidManifest.xml` |
-| **iOS** | `ios/Runner.xcodeproj/project.pbxproj`, `ios/Runner/Info.plist` (CFBundleName) |
-| **macOS** | `macos/Runner.xcodeproj/project.pbxproj`, `macos/Runner/Configs/AppInfo.xcconfig` (PRODUCT_NAME) |
-| **Linux** | `linux/CMakeLists.txt` (project name), `linux/my_application.cc` (resource prefix) |
-| **Windows** | `windows/CMakeLists.txt` (project name), `windows/runner/main.cpp` |
-| **Web** | `web/index.html` (title), `web/manifest.json` |
+| **Root** | `pubspec.yaml` (`name:` field), `README.md` |
+| **Android** | `android/app/build.gradle.kts` (`namespace`, `applicationId`), and rename the kotlin package directory `android/app/src/main/kotlin/com/example/hello_world/` → `.../sdl_window/` |
+| **iOS** | `ios/Runner.xcodeproj/project.pbxproj`, `ios/Runner/Info.plist` (`CFBundleName`) |
+| **macOS** | `macos/Runner.xcodeproj/project.pbxproj`, `macos/Runner/Configs/AppInfo.xcconfig` (`PRODUCT_NAME`) |
+| **Linux** | `linux/CMakeLists.txt` (`project()` and `BINARY_NAME`, `APPLICATION_ID`) |
+| **Windows** | `windows/CMakeLists.txt` (`project()` and `BINARY_NAME`) |
+| **Web** | `web/index.html` (`<title>` and `apple-mobile-web-app-title`), `web/manifest.json` (`name`, `short_name`) |
+
+> Files sometimes assumed to need renaming that actually do **not** contain `hello_world` references in this repo: `AndroidManifest.xml`, `windows/runner/main.cpp`, `linux/runner/my_application.cc`, `.metadata`. Skip them.
 
 > **Note:** Alternatively, run `./bin/flutter create examples/sdl_window` which would scaffold everything correctly using the Flutter Zero templates, avoiding manual renames.
 
@@ -104,6 +108,8 @@ Then run `dart pub get` from the repo root.
 ### Step 5: Write `main.dart`
 
 Create `examples/sdl_window/lib/main.dart` with the SDL3 application logic.
+
+> **API caveat:** the draft below uses the `sdlx*` ergonomic wrappers (`SdlWindowEx.create`, `sdlxPollEvent`, `SdlxQuitEvent`/`SdlxKeyboardEvent`/`SdlxMouseMotionEvent`, `SdlxColor`, `SdlxFRect`, `SdlkScancode`, renderer extension methods). These symbols are illustrative — only `SdlDynamicLibraryService`, `sdlInit`, and the `SDL_INIT_VIDEO`/`SDL_HINT_RENDER_VSYNC`/`SDL_WINDOW_RESIZABLE` constants are confirmed from the package README. Before writing real code, verify each `sdlx*` symbol against the actual `sdl3` package source (or its API docs) and adjust. If the wrappers don't exist as written, fall back to the raw `sdlCreateWindow` / `sdlPollEvent` / `sdlSetRenderDrawColor` style FFI calls.
 
 #### Structure of the code:
 
@@ -289,14 +295,18 @@ void main() {
 # From the repo root
 dart pub get
 
-# Run on macOS (requires SDL3 installed via brew)
-./bin/flutter run -d macos examples/sdl_window
+# Then run from inside the example directory (the flutter CLI
+# expects to be invoked from a Flutter project root):
+cd examples/sdl_window
 
-# Or run on Linux
-./bin/flutter run -d linux examples/sdl_window
+# macOS (requires SDL3 installed via brew)
+../../bin/flutter run -d macos
 
-# Or run on Windows
-./bin/flutter run -d windows examples/sdl_window
+# Linux
+../../bin/flutter run -d linux
+
+# Windows
+../../bin/flutter run -d windows
 ```
 
 ## Platform Notes

@@ -80,7 +80,7 @@ Every platform embedder has been rewritten to run the engine headlessly:
 
 Five patches modify the upstream `flutter_tools` to work without rendering:
 
-1. **Redirect storage URLs** — Gradle wrapper and iOS USB artifacts download from Google's servers; Flutter Zero's engine artifacts come from `engine.flutter0.dev`.
+1. **Preserve Google URLs for gradle/iOS-USB artifacts** — Engine artifacts come from `engine.flutter0.dev`, but the Gradle wrapper and iOS USB artifacts are explicitly routed back to Google's original storage URL (`storage.googleapis.com`) rather than the overridden mirror.
 2. **No CanvasKit** — Strips CanvasKit from web builds.
 3. **No texture registrar (Windows)** — Removes `flutter_texture_registrar.h`.
 4. **No `flutter_gpu`** — Removes `flutter_gpu` from SDK artifact downloads.
@@ -89,6 +89,15 @@ Five patches modify the upstream `flutter_tools` to work without rendering:
 ### Engine Build
 
 The engine is built via GN/Ninja (same as upstream Flutter). Prebuilt artifacts are hosted at `engine.flutter0.dev` (R2 storage). CI builds for macOS, Linux, and Windows via GitHub Actions using a content-aware hash to skip builds when the engine source hasn't changed.
+
+### Dart SDK Pinning
+
+The repository is a Dart workspace with two SDK constraints:
+
+- Root `pubspec.yaml` pins `sdk: ^3.9.0-0` for the workspace itself.
+- Workspace members (e.g. `examples/hello_world/pubspec.yaml`) pin `sdk: ^3.11.0-169.0.dev`, matching the engine's bundled Dart SDK.
+
+Adding a new workspace member that depends on packages requiring Dart ≥ 3.11 will also require bumping the root constraint.
 
 ## Capabilities as of Today
 
