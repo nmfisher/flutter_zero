@@ -43,8 +43,9 @@ consumer code below the canvas doesn't change.
 | `ThermionFrameScheduler` impl (port-based, real vsync-ish) | ✅ |
 | `RecordingCanvas` + `DisplayList` + `DrawCommand` types | ✅ |
 | `DisplayListExecutor` interface | ✅ |
-| `StubFilamentExecutor` (counts commands, draws nothing) | ✅ |
-| Real Filament executor (textured-quad emission, UI View setup) | ❌ — next |
+| `FilamentDisplayListExecutor`: pure-Dart rasterizer → RGBA8 buffer → Filament texture upload → background plane | ✅ |
+| Layering: UI texture is on Filament's **background plane** (cube renders in front) | ⚠️ — works, but inverse of desired |
+| UI on top of 3D (requires a transparent unlit material, see below) | ❌ — next |
 | Widget tree / layout above the Canvas | ❌ |
 | Hit-testing through the widget tree | ❌ |
 | Text rendering via glyph atlas | ❌ |
@@ -77,23 +78,59 @@ frames, 3N draw commands recorded.` then `Goodbye!`.
 
 ## Verified
 
-Linux x86_64 under Xvfb (Vulkan/llvmpipe). 325 frames driven by
-`ThermionFrameScheduler`, 975 draw commands recorded into display
-lists, clean shutdown. Screenshot at `screenshots/linux_xvfb.png` shows
-the lit cube (identical to `thermion_basic` — the UI overlay's empty
-because the executor is a stub).
+Linux x86_64 under Xvfb (Vulkan/llvmpipe). With the real executor:
+~390 frames driven by `ThermionFrameScheduler`, ~3120 draw commands
+(8 per frame × ~390 frames) software-rasterized into an 800×600 RGBA8
+buffer, uploaded to a Filament Texture, and displayed via the viewer's
+background plane. Clean shutdown.
 
 ```
-FilamentApp ready.
+FilamentDisplayListExecutor: 800x600 RGBA8 UI surface ready (background plane).
 Rendering. Press Escape or close the window to quit.
 vkCreateSwapchain: 800x600, ...
-  frame 60  (display list: 3 cmds)
-  frame 120  (display list: 3 cmds)
+  frame 60
+  frame 120
   ...
 Shutting down...
-UI executor stats: 325 frames, 975 draw commands recorded.
+UI executor stats: 391 frames, 3128 draw commands rasterized.
 Goodbye!
 ```
+
+Screenshots:
+- `screenshots/linux_xvfb.png` — earlier `StubFilamentExecutor` baseline,
+  no UI visible.
+- `screenshots/linux_xvfb_real_executor.png` — the current state: pink
+  HUD box (wobbling), grey frame outline, blue-tinted box cluster, all
+  rasterized into the background, with the 3D cube rendering on top.
+
+## Why the cube draws *over* the UI (and what to do about it)
+
+The current Filament wiring puts our texture on the viewer's
+background plane — Filament's stock `TexturedQuad` / image-material
+path is **opaque** (its fragment shader pre-blends `image × alpha +
+backgroundColor × (1 − alpha)` and outputs `alpha = 1`), so it can't
+be used as an overlay surface. Even with `View.BlendMode.transparent`,
+the quad's fragment alpha is implicitly 1 so nothing leaks through to
+the framebuffer.
+
+Two paths to actual overlay (cube *behind*, UI *on top*):
+
+1. **Custom transparent material** compiled via `matc`. ~30 lines of
+   `.mat` source declaring `blending: transparent` and a `sampler2d`
+   that gets sampled and emitted directly to `material.baseColor`
+   without the pre-multiply step. Drops into `createMaterial(Uint8List)`,
+   gets attached to a custom screen-space quad geometry. Hot path
+   doesn't change.
+2. **Second View + orthographic camera** attached to the same SwapChain
+   at `renderOrder: 1`, with our quad in its scene. Filament composites
+   the views automatically. More setup, no `matc` dependency.
+
+The seam from the canvas down to the upload doesn't move — we change
+*where* Filament displays the texture, not how we produce it.
+
+Also note: the current setup deliberately skips `viewer.setBackgroundColor`
+because that creates a Filament Skybox which overdraws the texture
+background plane.
 
 ## Build cost note
 
@@ -104,16 +141,20 @@ via `hooks_runner/shared/`). Subsequent runs are fast.
 
 ## Next steps
 
-- **Real `FilamentDisplayListExecutor`.** Create a second Filament
-  `View` with an orthographic camera + its own `Scene`, attach to the
-  same `SwapChain` at `renderOrder: 1`. Per frame: clear the UI scene,
-  walk the `DisplayList`, build a single `Geometry` containing all UI
-  quads (vertex colors, indices), submit via `createGeometry` with an
-  unlit material instance, add to the UI scene. That replaces
-  `StubFilamentExecutor` with no other changes.
+- **Flip layering to UI-on-top.** Pick path 1 or 2 from "Why the cube
+  draws over the UI" above. Path 2 (separate `View`) is probably the
+  right answer since it doesn't need `matc` and gives us a clean
+  separation for hit-testing later.
 - **Glyph atlas + `DrawTextCommand`.** stb_truetype-rasterized glyphs
-  into a `R8` Filament texture, `DrawText` translates to a run of
-  textured quads sampling the atlas.
+  blended directly into the same RGBA8 buffer the executor already
+  manages. No new infrastructure on the Filament side.
+- **Anti-aliasing.** The current `_fillRect`/`_strokeRect` are
+  pixel-grid only. AA over diagonals would benefit from supersampling
+  or moving to Blend2D.
+- **Dirty-region tracking.** Right now we re-upload the whole 800×600
+  RGBA8 buffer (~1.9 MB) every frame. Acceptable at this scale, but a
+  damage-list pass + `setSubImage` reduces bandwidth a lot when the UI
+  is mostly static.
 - **Widget tree.** Stateless first, build → layout → paint → walk into
   the canvas. Same shape as Flutter, smaller.
 - **Hit testing.** Wire into Thermion's `InputHandler` chain so UI

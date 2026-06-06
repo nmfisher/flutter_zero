@@ -108,7 +108,9 @@ Future<void> main() async {
   await FilamentApp.instance!.renderManager.attach(viewer.view, swapChain);
   await viewer.view.setFrustumCullingEnabled(false);
   await viewer.setViewport(_width, _height);
-  await viewer.setBackgroundColor(0.117, 0.117, 0.180, 1.0);
+  // Don't call setBackgroundColor — it adds a Filament Skybox which would
+  // overdraw the UI texture's background plane. The textured background
+  // quad below IS our background.
 
   // 4. 3D scene --------------------------------------------------------------
   await viewer.addDirectLight(DirectLight.sun(
@@ -130,7 +132,11 @@ Future<void> main() async {
 
   // 5. The framework wiring --------------------------------------------------
   final scheduler = ThermionFrameScheduler(targetFps: _targetFps);
-  final executor = StubFilamentExecutor();
+  final executor = await FilamentDisplayListExecutor.create(
+    viewer: viewer,
+    width: _width,
+    height: _height,
+  );
   final stopwatch = Stopwatch()..start();
   final quit = Completer<void>();
 
@@ -156,7 +162,7 @@ Future<void> main() async {
   // 6. Cleanup ---------------------------------------------------------------
   print('Shutting down...');
   print('UI executor stats: ${executor.framesExecuted} frames, '
-      '${executor.commandsTotal} draw commands recorded.');
+      '${executor.commandsTotal} draw commands rasterized.');
 
   scheduler.stop();
 
@@ -175,7 +181,7 @@ int _frames = 0;
 Future<void> _frame({
   required Duration timestamp,
   required ThermionFrameScheduler scheduler,
-  required StubFilamentExecutor executor,
+  required FilamentDisplayListExecutor executor,
   required Camera camera,
   required Stopwatch stopwatch,
   required Completer<void> quit,
@@ -198,22 +204,30 @@ Future<void> _frame({
   }
 
   // --- Build the per-frame display list ------------------------------------
-  // Even though the executor is a stub, exercising the recording API every
-  // frame proves the seam works end-to-end. When the real Filament executor
-  // lands, the consumer code here is unchanged.
+  // The texture lands on Filament's background plane (see executor docs for
+  // why overlay-on-top of 3D needs a custom transparent material). The 3D
+  // cube renders in front of whatever we paint here.
   final canvas = RecordingCanvas();
-  canvas.clear(const ui.Color(20, 20, 30));
-  // A "HUD" box that drifts horizontally — the kind of thing the eventual
-  // overlay would render.
+  canvas.clear(const ui.Color(30, 30, 46)); // Catppuccin Mocha base
+  // A "HUD" box that drifts horizontally.
   final wobble = sin(timestamp.inMicroseconds / 1e6) * 60;
   canvas.fillRect(
     ui.Rect(20 + wobble, 20, 200, 40),
-    const ui.Color(243, 139, 168),
+    const ui.Color(243, 139, 168), // pink
   );
+  // Frame outline.
   canvas.strokeRect(
     const ui.Rect(20, 80, 760, 500),
     const ui.Color(166, 173, 200),
+    width: 2,
   );
+  // Cluster of small boxes for visual interest.
+  for (var i = 0; i < 5; i++) {
+    canvas.fillRect(
+      ui.Rect(580.0 + i * 12, 540, 8, 50),
+      const ui.Color(180, 190, 254),
+    );
+  }
   await executor.execute(canvas.build());
 
   // --- Orbit the camera around the cube ------------------------------------
