@@ -1,0 +1,24 @@
+name: thermion_ui
+description: "Flutter Zero example: sdl_ui's framework abstractions wired against Thermion."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.0-0
+
+hooks:
+  user_defines:
+    thermion_dart:
+      mode: release
+
+dependencies:
+  thermion_dart:
+    git:
+      url: https://github.com/nmfisher/thermion.git
+      ref: develop
+      path: thermion_dart
+  sdl3: ^2.8.5
+  vector_math: ^2.1.0
+
+dev_dependencies:
+  lints: ^6.0.0
