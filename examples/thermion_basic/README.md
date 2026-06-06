@@ -1,37 +1,42 @@
 # thermion_basic
 
-Vanilla Thermion bootstrap into an SDL3 window — no UI layer yet. Opens
-an 800×600 window, hands the backing `CAMetalLayer` to Filament, renders
-a Catppuccin-flavoured background continuously. Escape or closing the
-window quits.
+Vanilla Thermion bootstrap into an SDL3 window. Opens an 800×600 window,
+hands the backing native surface to Filament, renders a solid background
+at 60Hz. Escape or closing the window quits.
 
-This validates three things:
+This validates four things:
 
-1. The Filament Metal backend bootstraps against an externally-owned
-   `CAMetalLayer` (SDL3 owns the layer, Filament owns the swapchain).
-2. `registerRequestFrameHook` actually fires per frame on the Dart
-   thread.
-3. SDL3 event polling coexists with Filament's render thread (Thermion
-   spawns its own native render thread; our SDL polling runs on the
-   Dart main thread inside the frame hook).
+1. The Filament backend bootstraps against an externally-owned native
+   surface (CAMetalLayer on macOS, X11 Window on Linux/X11).
+2. Thermion's port-based `FrameScheduler` drives continuous rendering on
+   the Dart event loop — `setRendering(true)` is a no-op on native, so
+   the actual loop comes from `FrameScheduler_startWithPort`.
+3. SDL3 event polling coexists with Filament's render thread (events
+   pumped inside the frame listener; render happens on Thermion's render
+   thread, dispatched per `FilamentApp.instance!.render()`).
+4. The basic teardown path (with one known workaround — see below).
 
-It's the windowed peer of Thermion's own `examples/dart/cli_headless` —
-the latter writes a frame to a BMP file, this one shows it in a window.
+It's the windowed peer of Thermion's own `examples/dart/cli_headless`.
 
-## macOS only for now
+## Supported platforms
 
-This example targets macOS. Filament's other backends (Vulkan on
-Linux/Windows, OpenGL on web) need different surface-acquisition glue
-than `CAMetalLayer`. Cross-platform support is a follow-up.
+- **macOS** (arm64 or x86_64) — Metal via SDL3's `SDL_Metal_CreateView`.
+- **Linux/X11** (verified under Xvfb with llvmpipe) — Vulkan via the
+  X11 Window XID.
+
+Other platforms TBD.
 
 ## Requirements
 
-- macOS (arm64 or x86_64)
-- Flutter Zero's bundled Dart SDK (Dart 3.13.0-beta).
-- SDL3 installed via Homebrew:
-  ```sh
-  brew install sdl3
-  ```
+- Flutter Zero's bundled Dart SDK (3.13.0-beta or compatible). Native
+  assets are on by default — no experiment flag needed.
+- A C/C++ toolchain (Thermion compiles FFI glue locally and links
+  against a precompiled Filament archive it downloads from Cloudflare).
+- **macOS:** `brew install sdl3`
+- **Linux:** SDL3 ≥ 3.2 built from source (Ubuntu's repos still ship
+  SDL2 only); see `../sdl_window/README.md` for the build recipe. A
+  Vulkan loader needs to be available — `libvulkan1` from the distro,
+  plus llvmpipe (Mesa) for headless / xvfb work.
 
 ## Dependencies
 
@@ -42,13 +47,15 @@ workspace's pinned versions. It resolves its own deps via its own
 
 - `thermion_dart` from the `develop` branch of
   [nmfisher/thermion](https://github.com/nmfisher/thermion). Pub.dev
-  currently has 0.3.4+1, but the windowed-swapchain API surface this
-  example uses lives on develop / 0.4.0.
+  currently has 0.3.4+1, but the windowed-swapchain API surface we
+  use here lives on `develop` / 0.4.0 (e.g.
+  `RenderManager.attach(view, swapChain)` instead of the older
+  `FilamentApp.register`, and the port-based `FrameScheduler`).
 - `sdl3 ^2.8.5` for window and event handling.
 
-The `pubspec.yaml` pins `hooks.user_defines.thermion_dart.mode: debug`,
-which matches the precompiled Filament binaries Thermion downloads from
-its CDN for macOS.
+The `pubspec.yaml` pins `hooks.user_defines.thermion_dart.mode: release`
+because Thermion only publishes Linux precompiled binaries in release
+mode (macOS has both).
 
 ## Running
 
@@ -58,37 +65,89 @@ cd examples/thermion_basic
 ../../bin/dart run lib/main.dart
 ```
 
-Expected behaviour: an 800×600 window opens, draws a dark
-Catppuccin-Mocha background, prints `frame 60`, `frame 120`, … every
-~1s. Escape or closing the window prints `Shutting down...` and exits.
+Headless under Xvfb (Linux):
+
+```sh
+xvfb-run -s "-screen 0 800x600x24" ../../bin/dart run lib/main.dart
+```
+
+Expected behaviour: window opens, dark background, prints `frame 60`,
+`frame 120`, … once a second. Escape, closing the window, or SIGTERM
+(SDL3 catches it and posts an `SDL_QUIT` to the event queue) triggers
+shutdown with `Shutting down...` then `Goodbye!`.
 
 ## Implementation notes
 
-- **Metal layer plumbing.** The `sdl3 2.8.5` package's Dart bindings for
-  `SDL_Metal_CreateView` / `SDL_Metal_GetLayer` have broken signatures
-  (return `Void`, drop their `view` argument). We work around this by
-  looking up both symbols directly via `DynamicLibrary.open(...)` and
-  calling them with the correct C signatures. Worth filing upstream.
-- **Frame hook.** We register an async callback via
-  `FilamentApp.instance!.registerRequestFrameHook(...)`. Thermion's
-  render thread calls into it on the Dart main thread once per frame,
-  before the GPU submission. We use it to drain SDL events.
-- **Quit.** A `Completer<void>` gets completed when SDL surfaces a
-  quit event or Escape, the outer `await` returns, and the cleanup
-  path runs in order: stop rendering → unregister hook → dispose
-  viewer → destroy FilamentApp → destroy SDL view + window → quit SDL.
-- **No UI layer.** Intentionally. The `FrameScheduler` /
-  `RecordingCanvas` / widget-tree work from `UI_BRAINSTORMING.md` and
-  `RENDERING.md` will plug in above this baseline once the bootstrap
-  is solid.
+- **Frame loop.** On native targets Thermion's `setRendering(true)` is
+  a no-op (it only attaches the view to the swapchain; the
+  RenderManager-attached-to-render-thread path is web-only). The actual
+  per-frame driver is `FrameScheduler_startWithPort(nativePort,
+  targetFps)`, which spawns a native scheduler thread that posts an
+  int via `Dart_PostCObject_DL` per frame. A Dart `ReceivePort`
+  listener wakes up, drains SDL events, and calls
+  `FilamentApp.instance!.render()`. This is the same pattern as
+  Thermion's `examples/dart/cli_windows`.
+- **macOS metal layer plumbing.** The `sdl3 2.8.5` package's Dart
+  bindings for `SDL_Metal_CreateView` / `SDL_Metal_GetLayer` have
+  broken C signatures (declare `Void` returns and drop the `view`
+  argument). We work around this by looking up both symbols directly
+  via `DynamicLibrary.open(...)` and calling with the correct C
+  signatures. Worth filing upstream against `sdl3`.
+- **Linux X11 plumbing.** Filament's stock `VulkanPlatform` on Linux
+  interprets the swapchain handle as an X11 `Window` XID (see
+  `filament/SwapChain.h`). SDL3 exposes this via
+  `SDL_PROP_WINDOW_X11_WINDOW_NUMBER`, so the Linux path is just
+  `sdlGetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0)`
+  cast to a `Pointer` and handed to `createSwapChain`. Wayland and
+  Windows would need their own glue.
+- **Shutdown bug workaround.** `viewer.dispose()` followed by
+  `FilamentApp.destroy()` currently throws "Concurrent modification
+  during iteration" in Thermion 0.4.0/develop's
+  `FFIFilamentApp.destroy` (an iteration over the swapchain list while
+  the list is being mutated). The cli_windows example sidesteps this
+  by just calling `FrameScheduler_stop()` and killing the isolate, so
+  we do the same. Worth filing upstream against Thermion.
+
+## Verified on this branch
+
+Linux x86_64 under Xvfb (Ubuntu 24.04 container, software Vulkan via
+llvmpipe):
+
+```
+SDL3 window created. Native surface @ 0x20002e
+Bootstrapping FFIFilamentApp...
+FEngine (64 bits) created at 0x... (threading is enabled)
+FEngine resolved backend: Vulkan
+Vulkan device driver: llvmpipe Mesa 25.2.8-0ubuntu0.24.04.1 (LLVM 20.1.2)
+Selected physical device 'llvmpipe (LLVM 20.1.2, 128 bits)' ...
+Backend feature level: 3
+FEngine feature level: 1
+FilamentApp ready.
+Rendering. Press Escape or close the window to quit.
+vkCreateSwapchain: 800x600, 44, 0, swapchain-size=4, ...
+  frame 60
+  frame 120
+Shutting down...
+Goodbye!
+```
+
+`scrot` of the Xvfb framebuffer confirms a solid muted-purple fill (the
+Catppuccin Mocha base color after Filament's default tone mapping). The
+exact RGB doesn't match what we passed to `setBackgroundColor` because
+Filament treats it as linear and runs ACES tone-mapping over it — that's
+expected, not a bug in the integration.
 
 ## Next steps
 
-- Drop a glTF asset into the scene to confirm the full render pipeline
-  works (load with `viewer.loadGltf(...)`).
+- Drop a glTF asset into the scene to validate the full render pipeline
+  (`viewer.loadGltf(...)`).
 - Implement a `ThermionFrameScheduler` that satisfies our framework's
-  `FrameScheduler` interface and wraps `registerRequestFrameHook`.
+  `FrameScheduler` interface (`examples/sdl_ui/lib/src/scheduler.dart`)
+  and wraps `FrameScheduler_startWithPort`. This becomes the
+  approach-(B) implementation for our UI work.
 - A second `View` attached to the same SwapChain at `renderOrder: 1`
   for UI overlay.
-- Linux (Vulkan via `wl_egl_window`/`xlib`) and Windows (D3D12) variants
-  once the macOS path is solid.
+- Windows (D3D12 via `SDL_PROP_WINDOW_WIN32_HWND_POINTER`).
+- File the two upstream issues observed during this work: broken
+  `SDL_Metal_*` bindings in `sdl3 2.8.5`, and the swapchain-list
+  concurrent-modification bug in `FFIFilamentApp.destroy`.

@@ -9,7 +9,7 @@ environment:
 hooks:
   user_defines:
     thermion_dart:
-      mode: debug
+      mode: release
 
 dependencies:
   thermion_dart:
