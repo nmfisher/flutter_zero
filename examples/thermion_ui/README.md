@@ -43,10 +43,10 @@ consumer code below the canvas doesn't change.
 | `ThermionFrameScheduler` impl (port-based, real vsync-ish) | ✅ |
 | `RecordingCanvas` + `DisplayList` + `DrawCommand` types | ✅ |
 | `DisplayListExecutor` interface | ✅ |
-| `FilamentDisplayListExecutor`: pure-Dart rasterizer → RGBA8 buffer → Filament texture upload → background plane | ✅ |
-| Layering: UI texture is on Filament's **background plane** (cube renders in front) | ⚠️ — works, but inverse of desired |
-| UI on top of 3D (requires a transparent unlit material, see below) | ❌ — next |
-| Widget tree / layout above the Canvas | ❌ |
+| `FilamentDisplayListExecutor`: pure-Dart rasterizer → RGBA8 buffer → Filament texture upload | ✅ |
+| UI rendered on a separate Filament `View` at `renderOrder: 1`, composited on top of the 3D scene | ✅ |
+| Alpha blending against 3D output (transparent clear, translucent panels) | ✅ |
+| Widget tree / layout above the Canvas | ❌ — next |
 | Hit-testing through the widget tree | ❌ |
 | Text rendering via glyph atlas | ❌ |
 
@@ -78,59 +78,70 @@ frames, 3N draw commands recorded.` then `Goodbye!`.
 
 ## Verified
 
-Linux x86_64 under Xvfb (Vulkan/llvmpipe). With the real executor:
-~390 frames driven by `ThermionFrameScheduler`, ~3120 draw commands
-(8 per frame × ~390 frames) software-rasterized into an 800×600 RGBA8
-buffer, uploaded to a Filament Texture, and displayed via the viewer's
-background plane. Clean shutdown.
+Linux x86_64 under Xvfb (Vulkan/llvmpipe). ~390 frames driven by
+`ThermionFrameScheduler`, ~1520 draw commands (4 per frame ×
+~390 frames) software-rasterized into an 800×600 RGBA8 buffer,
+uploaded to a Filament Texture, and composited on top of the 3D scene
+via a separate UI View at `renderOrder: 1`.
 
 ```
-FilamentDisplayListExecutor: 800x600 RGBA8 UI surface ready (background plane).
+FilamentDisplayListExecutor: 800x600 RGBA8 UI on a transparent overlay View (renderOrder: 1).
 Rendering. Press Escape or close the window to quit.
 vkCreateSwapchain: 800x600, ...
-  frame 60
-  frame 120
+  frame 60  (display list: 4 cmds)
+  frame 120  (display list: 4 cmds)
   ...
 Shutting down...
-UI executor stats: 391 frames, 3128 draw commands rasterized.
+UI executor stats: 382 frames, 1528 draw commands rasterized.
 Goodbye!
 ```
 
 Screenshots:
-- `screenshots/linux_xvfb.png` — earlier `StubFilamentExecutor` baseline,
-  no UI visible.
-- `screenshots/linux_xvfb_real_executor.png` — the current state: pink
-  HUD box (wobbling), grey frame outline, blue-tinted box cluster, all
-  rasterized into the background, with the 3D cube rendering on top.
+- `screenshots/linux_xvfb.png` — `StubFilamentExecutor` baseline, no UI
+  visible (predates the real executor).
+- `screenshots/linux_xvfb_real_executor.png` — earlier
+  background-plane iteration (UI behind cube).
+- `screenshots/linux_xvfb_overlay.png` — **current state**: pink HUD
+  box and grey frame outline drawn *over* the cube; translucent dark
+  panel at bottom-right reveals the cube through it.
 
-## Why the cube draws *over* the UI (and what to do about it)
+## How the overlay is wired
 
-The current Filament wiring puts our texture on the viewer's
-background plane — Filament's stock `TexturedQuad` / image-material
-path is **opaque** (its fragment shader pre-blends `image × alpha +
-backgroundColor × (1 − alpha)` and outputs `alpha = 1`), so it can't
-be used as an overlay surface. Even with `View.BlendMode.transparent`,
-the quad's fragment alpha is implicitly 1 so nothing leaks through to
-the framebuffer.
+Per the user's call — Filament does 3D rendering only, our software
+rasterizer does 2D, and we hand Filament a texture to composite. The
+on-Filament-side shape:
 
-Two paths to actual overlay (cube *behind*, UI *on top*):
+1. **A Filament `Texture`** (RGBA8, viewport-sized, `SAMPLEABLE | UPLOADABLE`).
+   The executor updates it every frame via `Texture.setImage(0, ...)`.
+2. **An unlit ubershader `MaterialInstance`** with
+   `hasBaseColorTexture: true`, `alphaMode: AlphaMode.BLEND`,
+   `doubleSided: true`. The texture is bound as `baseColorMap`.
+3. **A fullscreen quad geometry** in NDC: vertices `[-1,-1,0]`..`[1,1,0]`,
+   normals `(0, 0, 1)`, UVs flipped on V so row 0 of the buffer maps
+   to the top of the screen.
+4. **A new `Scene`** containing only that quad, with the material
+   instance applied.
+5. **A new `Camera`** with `Projection.Orthographic` set to
+   `[-1, 1] × [-1, 1]`, near 0.1, far 10, positioned at `(0, 0, 1)`
+   looking at origin.
+6. **A new `View`** with that scene + camera, viewport
+   `width × height`, `BlendMode.transparent`, post-processing off,
+   frustum culling off.
+7. **`renderManager.attach(uiView, swapChain, renderOrder: 1)`** so
+   Filament composites the UI view *after* the 3D view, alpha-blending
+   against the existing framebuffer content.
 
-1. **Custom transparent material** compiled via `matc`. ~30 lines of
-   `.mat` source declaring `blending: transparent` and a `sampler2d`
-   that gets sampled and emitted directly to `material.baseColor`
-   without the pre-multiply step. Drops into `createMaterial(Uint8List)`,
-   gets attached to a custom screen-space quad geometry. Hot path
-   doesn't change.
-2. **Second View + orthographic camera** attached to the same SwapChain
-   at `renderOrder: 1`, with our quad in its scene. Filament composites
-   the views automatically. More setup, no `matc` dependency.
+## Gotcha that ate hours during bring-up
 
-The seam from the canvas down to the upload doesn't move — we change
-*where* Filament displays the texture, not how we produce it.
-
-Also note: the current setup deliberately skips `viewer.setBackgroundColor`
-because that creates a Filament Skybox which overdraws the texture
-background plane.
+The ubershader fragment shader computes
+`color = baseColorTexture × baseColorFactor`. `baseColorFactor`
+defaults to `(0, 0, 0, 0)`. So unless you explicitly call
+`setBaseColorFactor(1.0, 1.0, 1.0, 1.0)` after `setBaseColorTexture`,
+your texture sample multiplies to zero and every UI pixel is fully
+transparent black. The view renders, the texture is correctly
+uploaded — nothing visible. Worth either documenting upstream in
+Thermion or defaulting the factor to white when `hasBaseColorTexture`
+is true.
 
 ## Build cost note
 
@@ -141,10 +152,6 @@ via `hooks_runner/shared/`). Subsequent runs are fast.
 
 ## Next steps
 
-- **Flip layering to UI-on-top.** Pick path 1 or 2 from "Why the cube
-  draws over the UI" above. Path 2 (separate `View`) is probably the
-  right answer since it doesn't need `matc` and gives us a clean
-  separation for hit-testing later.
 - **Glyph atlas + `DrawTextCommand`.** stb_truetype-rasterized glyphs
   blended directly into the same RGBA8 buffer the executor already
   manages. No new infrastructure on the Filament side.

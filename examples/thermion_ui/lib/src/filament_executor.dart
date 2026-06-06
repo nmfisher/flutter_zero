@@ -21,8 +21,9 @@ class StubFilamentExecutor implements DisplayListExecutor {
 }
 
 /// Real executor — software-rasterizes the DisplayList into an RGBA8 buffer
-/// each frame, uploads to a Filament Texture, and asks Filament to display
-/// it on the scene's background plane.
+/// each frame, uploads to a Filament Texture, and composites it ON TOP of
+/// the 3D scene via a separate Filament View attached to the same SwapChain
+/// at `renderOrder: 1`.
 ///
 /// Architecture (per the user's call: Filament does 3D only, we own 2D):
 ///
@@ -32,23 +33,22 @@ class StubFilamentExecutor implements DisplayListExecutor {
 ///                              Texture.setImage(0, ...)   one upload per frame
 ///                                              │
 ///                                              ↓
-///               viewer.setBackgroundImageFromTexture(texture)
-///
-/// **Caveat for this iteration:** the texture lands on Filament's
-/// *background* plane (behind the 3D content) rather than as an overlay
-/// on top. The stock `TexturedQuad` / image-material path is OPAQUE — its
-/// fragment shader pre-blends inside the material and outputs alpha=1, so
-/// it can't be used as an overlay surface. A real overlay needs either
-/// a custom transparent material (compiled via `matc`) or a separate UI
-/// `View` with an orthographic camera and its own quad geometry — both a
-/// chunk more work than the seam shape itself. This commit gets the
-/// rasterizer + upload + Filament wiring correct end-to-end so the
-/// overlay-positioning rework is purely about *where* the texture renders,
-/// not whether the pipeline works.
+///         UI View → orthographic camera → fullscreen quad
+///         (unlit ubershader, AlphaMode.BLEND, baseColorMap=our texture)
+///                                              │
+///                                              ↓
+///       SwapChain composes the 3D View (order 0) and UI View (order 1)
 ///
 /// The 2D backend stays in 2D land. To upgrade quality (AA, gradients,
 /// text), swap the rasterizer body — Blend2D, NanoVG-to-buffer, anything
 /// that can produce a `Uint8List` — without changing the Filament side.
+///
+/// **Notable gotcha during bring-up:** the ubershader's `baseColorFactor`
+/// uniform defaults to `(0, 0, 0, 0)`. The fragment color is
+/// `baseColorTexture × baseColorFactor`, so without explicitly setting the
+/// factor to `(1, 1, 1, 1)` everything multiplies to zero — the UI view
+/// renders, but every pixel is transparent black. `setBaseColorFactor`
+/// below is load-bearing, not cosmetic.
 class FilamentDisplayListExecutor implements DisplayListExecutor {
   FilamentDisplayListExecutor._({
     required this.width,
@@ -65,44 +65,115 @@ class FilamentDisplayListExecutor implements DisplayListExecutor {
   int framesExecuted = 0;
   int commandsTotal = 0;
 
-  /// Construct the executor and bind its texture to the viewer's background.
+  /// Construct the executor, set up the UI View, and attach it to the
+  /// SwapChain at `renderOrder: 1` so it draws on top of the 3D View.
   static Future<FilamentDisplayListExecutor> create({
-    required ThermionViewer viewer,
     required int width,
     required int height,
+    required SwapChain swapChain,
   }) async {
-    final texture = await FilamentApp.instance!.createTexture(
+    final app = FilamentApp.instance!;
+
+    // 1. The UI surface texture (RGBA8) and an empty seed upload.
+    final texture = await app.createTexture(
       width,
       height,
       textureFormat: TextureFormat.RGBA8,
-      // Default flags are just SAMPLEABLE; we also need UPLOADABLE to call
-      // setImage() per frame from the CPU side.
       flags: const {
         TextureUsage.TEXTURE_USAGE_SAMPLEABLE,
         TextureUsage.TEXTURE_USAGE_UPLOADABLE,
       },
     );
-    // Seed with the Catppuccin background color so the first frame isn't
-    // black before the rasterizer fills it in.
-    final initial = Uint8List(width * height * 4);
-    for (var i = 0; i < initial.length; i += 4) {
-      initial[i] = 30;
-      initial[i + 1] = 30;
-      initial[i + 2] = 46;
-      initial[i + 3] = 255;
-    }
+    final seed = Uint8List(width * height * 4); // all zero = transparent
     await texture.setImage(
       0,
-      initial,
+      seed,
       width,
       height,
       PixelDataFormat.RGBA,
       PixelDataType.UBYTE,
     );
 
-    await viewer.setBackgroundImageFromTexture(texture);
+    // 2. Material: unlit ubershader with a base-color texture, alpha blend.
+    //    AlphaMode.BLEND emits per-fragment alpha so the UI View's
+    //    transparent blend composites it over the 3D output.
+    final material = await app.createUbershaderMaterial(
+      unlit: true,
+      hasBaseColorTexture: true,
+      alphaMode: AlphaMode.BLEND,
+      doubleSided: true,
+      baseColorUV: 0,
+    );
+    final sampler = await app.createTextureSampler();
+    await material.setBaseColorTexture(texture, sampler);
+    // Ubershader multiplies the texture sample by baseColorFactor. Default
+    // is (0,0,0,0) which silently zeros everything out — set it to white.
+    await material.setBaseColorFactor(1.0, 1.0, 1.0, 1.0);
 
-    print('FilamentDisplayListExecutor: ${width}x$height RGBA8 UI surface ready (background plane).');
+    // 3. Screen-filling quad in NDC space.
+    //    Vertices in world coords [-1, 1] × [-1, 1] at z=0. The V axis is
+    //    flipped so texture row 0 (top of our buffer) maps to the top of
+    //    the screen.
+    final vertices = Float32List.fromList([
+      -1.0, -1.0, 0.0,
+      1.0, -1.0, 0.0,
+      1.0, 1.0, 0.0,
+      -1.0, 1.0, 0.0,
+    ]);
+    final indices = [0, 1, 2, 0, 2, 3];
+    final uvs = Float32List.fromList([
+      0.0, 1.0, // bottom-left  → samples row height-1 (bottom of buffer)
+      1.0, 1.0, // bottom-right
+      1.0, 0.0, // top-right    → samples row 0 (top of buffer)
+      0.0, 0.0, // top-left
+    ]);
+    // Normals (0, 0, 1) for all vertices — quad faces +Z toward the
+    // camera. The ubershader vertex layout requires normals even for unlit
+    // materials.
+    final normals = Float32List.fromList([
+      0.0, 0.0, 1.0,
+      0.0, 0.0, 1.0,
+      0.0, 0.0, 1.0,
+      0.0, 0.0, 1.0,
+    ]);
+    final geometry = Geometry(
+      vertices,
+      indices,
+      normals: normals,
+      uvs: uvs,
+      primitiveType: PrimitiveType.TRIANGLES,
+      indexType: IndexType.UINT,
+    );
+
+    final quadAsset = await app.createGeometry(
+      geometry,
+      materialInstances: [material.materialInstance],
+    );
+
+    // 4. UI scene + camera + view.
+    final uiScene = await app.createScene();
+    await uiScene.add(quadAsset);
+
+    final uiCamera = await app.createCamera();
+    await uiCamera.setProjection(
+      Projection.Orthographic,
+      -1, 1, -1, 1, 0.1, 10,
+    );
+    await uiCamera.lookAt(Vector3(0, 0, 1));
+
+    final uiView = await app.createView();
+    await uiView.setName('ui');
+    await uiView.setScene(uiScene);
+    await uiView.setCamera(uiCamera);
+    await uiView.setViewport(width, height);
+    await uiView.setBlendMode(BlendMode.transparent);
+    await uiView.setPostProcessing(false);
+    await uiView.setFrustumCullingEnabled(false);
+
+    await app.renderManager.attach(uiView, swapChain, renderOrder: 1);
+
+    print('FilamentDisplayListExecutor: ${width}x$height RGBA8 UI on a '
+        'transparent overlay View (renderOrder: 1).');
     return FilamentDisplayListExecutor._(
       width: width,
       height: height,
@@ -115,8 +186,6 @@ class FilamentDisplayListExecutor implements DisplayListExecutor {
     framesExecuted++;
     commandsTotal += list.length;
 
-    // Start each frame fully transparent so 3D shows through everywhere
-    // not explicitly painted over.
     _buffer.fillRange(0, _buffer.length, 0);
 
     var tx = 0;
@@ -141,10 +210,10 @@ class FilamentDisplayListExecutor implements DisplayListExecutor {
           final y0 = rect.y.toInt() + ty;
           final rw = rect.width.toInt();
           final rh = rect.height.toInt();
-          _fillRect(x0, y0, rw, w, color); // top
-          _fillRect(x0, y0 + rh - w, rw, w, color); // bottom
-          _fillRect(x0, y0, w, rh, color); // left
-          _fillRect(x0 + rw - w, y0, w, rh, color); // right
+          _fillRect(x0, y0, rw, w, color);
+          _fillRect(x0, y0 + rh - w, rw, w, color);
+          _fillRect(x0, y0, w, rh, color);
+          _fillRect(x0 + rw - w, y0, w, rh, color);
         case SaveCommand():
           stack.add([tx, ty]);
         case RestoreCommand():
@@ -169,9 +238,6 @@ class FilamentDisplayListExecutor implements DisplayListExecutor {
     );
   }
 
-  /// Source-over blend the colour into the buffer, clamped to bounds.
-  /// `color.a == 255` is a fast-path overwrite; partial alpha does a
-  /// standard porter-duff source-over against whatever's in the buffer.
   void _fillRect(int x, int y, int w, int h, ui.Color color) {
     final x0 = x.clamp(0, width);
     final y0 = y.clamp(0, height);
@@ -193,7 +259,6 @@ class FilamentDisplayListExecutor implements DisplayListExecutor {
       return;
     }
 
-    // Source-over: out = src * srcA + dst * (1 - srcA)
     final srcA = color.a;
     final invA = 255 - srcA;
     for (var py = y0; py < y1; py++) {

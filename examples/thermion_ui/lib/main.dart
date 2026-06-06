@@ -108,9 +108,7 @@ Future<void> main() async {
   await FilamentApp.instance!.renderManager.attach(viewer.view, swapChain);
   await viewer.view.setFrustumCullingEnabled(false);
   await viewer.setViewport(_width, _height);
-  // Don't call setBackgroundColor — it adds a Filament Skybox which would
-  // overdraw the UI texture's background plane. The textured background
-  // quad below IS our background.
+  await viewer.setBackgroundColor(0.117, 0.117, 0.180, 1.0);
 
   // 4. 3D scene --------------------------------------------------------------
   await viewer.addDirectLight(DirectLight.sun(
@@ -133,9 +131,9 @@ Future<void> main() async {
   // 5. The framework wiring --------------------------------------------------
   final scheduler = ThermionFrameScheduler(targetFps: _targetFps);
   final executor = await FilamentDisplayListExecutor.create(
-    viewer: viewer,
     width: _width,
     height: _height,
+    swapChain: swapChain,
   );
   final stopwatch = Stopwatch()..start();
   final quit = Completer<void>();
@@ -204,30 +202,27 @@ Future<void> _frame({
   }
 
   // --- Build the per-frame display list ------------------------------------
-  // The texture lands on Filament's background plane (see executor docs for
-  // why overlay-on-top of 3D needs a custom transparent material). The 3D
-  // cube renders in front of whatever we paint here.
+  // UI overlay on a transparent View — clear to alpha 0 so the 3D cube
+  // shows through everywhere we don't paint.
   final canvas = RecordingCanvas();
-  canvas.clear(const ui.Color(30, 30, 46)); // Catppuccin Mocha base
+  canvas.clear(const ui.Color(0, 0, 0, 0));
   // A "HUD" box that drifts horizontally.
   final wobble = sin(timestamp.inMicroseconds / 1e6) * 60;
   canvas.fillRect(
     ui.Rect(20 + wobble, 20, 200, 40),
-    const ui.Color(243, 139, 168), // pink
+    const ui.Color(243, 139, 168), // pink, opaque
   );
-  // Frame outline.
+  // Translucent corner panel — proves alpha blending works against 3D.
+  canvas.fillRect(
+    const ui.Rect(580, 540, 200, 50),
+    const ui.Color(30, 30, 46, 200),
+  );
+  // Frame outline around the viewport.
   canvas.strokeRect(
     const ui.Rect(20, 80, 760, 500),
     const ui.Color(166, 173, 200),
     width: 2,
   );
-  // Cluster of small boxes for visual interest.
-  for (var i = 0; i < 5; i++) {
-    canvas.fillRect(
-      ui.Rect(580.0 + i * 12, 540, 8, 50),
-      const ui.Color(180, 190, 254),
-    );
-  }
   await executor.execute(canvas.build());
 
   // --- Orbit the camera around the cube ------------------------------------
