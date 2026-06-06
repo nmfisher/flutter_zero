@@ -9,7 +9,7 @@ import 'package:sdl3/sdl3.dart';
 const _width = 800;
 const _height = 600;
 
-void main() {
+Future<void> main() async {
   _registerSdlLibrary();
 
   if (!sdlInit(SDL_INIT_VIDEO)) {
@@ -127,6 +127,11 @@ void main() {
       ..rect(SdlxFRect(x: mouseX - 14, y: mouseY - 14, w: 28, h: 28));
 
     renderer.present();
+
+    // Yield so the embedder message loop can pump between frames — Dart
+    // microtasks, Future callbacks, dart:io async, and isolate SendPort
+    // messages all rely on this. See UI_BRAINSTORMING.md for the A→B plan.
+    await Future<void>.delayed(Duration.zero);
   }
 
   renderer.destroy();
