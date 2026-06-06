@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:ffi';
 import 'dart:io' show File, Platform;
 import 'dart:isolate';
+import 'dart:math';
 
 import 'package:sdl3/sdl3.dart';
 import 'package:thermion_dart/thermion_dart.dart';
@@ -111,7 +112,33 @@ Future<void> main() async {
   await viewer.setViewport(_width, _height);
   await viewer.setBackgroundColor(0.117, 0.117, 0.180, 1.0); // Catppuccin Mocha base
 
-  // 4. Port-based frame loop -------------------------------------------------
+  // 4. Scene: a few lights and a cube at the origin --------------------------
+  // Key light (warm), low enough that LDR doesn't clip to flat white.
+  await viewer.addDirectLight(DirectLight.sun(
+    intensity: 25000.0,
+    color: const LinearColor(1.0, 0.95, 0.85),
+    direction: Vector3(-0.4, -0.7, -0.6)..normalize(),
+    castShadows: false,
+  ));
+  // Fill light from the opposite side so back faces aren't black.
+  await viewer.addDirectLight(DirectLight.sun(
+    intensity: 8000.0,
+    color: const LinearColor(0.6, 0.7, 1.0),
+    direction: Vector3(0.5, -0.3, 0.5)..normalize(),
+    castShadows: false,
+  ));
+
+  // `createGeometry` without explicit materials uses the default ubershader
+  // material — PBR-lit white.
+  await viewer.createGeometry(GeometryUtils.cube());
+
+  // Camera setup: perspective projection, initial orbit position.
+  final camera = await viewer.getActiveCamera();
+  await camera.setLensProjection();
+
+  final stopwatch = Stopwatch()..start();
+
+  // 5. Port-based frame loop -------------------------------------------------
   // Thermion's port-based FrameScheduler spawns a native thread that posts
   // an int per frame to the supplied SendPort.nativePort. Dart's event loop
   // wakes up, listener runs, we drain SDL events + call render().
@@ -137,6 +164,12 @@ Future<void> main() async {
         return;
       }
     }
+
+    // Orbit the camera slowly around the cube (one revolution every 12s).
+    final t = stopwatch.elapsedMilliseconds / 1000.0;
+    final angle = t * (2 * pi / 12);
+    final orbit = Vector3(4 * sin(angle), 2.5, 4 * cos(angle));
+    await camera.lookAt(orbit);
 
     await FilamentApp.instance!.render();
     if (++frames % _targetFps == 0) {

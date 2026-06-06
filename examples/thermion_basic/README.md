@@ -1,8 +1,8 @@
 # thermion_basic
 
 Vanilla Thermion bootstrap into an SDL3 window. Opens an 800×600 window,
-hands the backing native surface to Filament, renders a solid background
-at 60Hz. Escape or closing the window quits.
+hands the backing native surface to Filament, renders a lit cube orbiting
+under a perspective camera at 60Hz. Escape or closing the window quits.
 
 This validates four things:
 
@@ -131,11 +131,12 @@ Shutting down...
 Goodbye!
 ```
 
-`scrot` of the Xvfb framebuffer confirms a solid muted-purple fill (the
-Catppuccin Mocha base color after Filament's default tone mapping). The
-exact RGB doesn't match what we passed to `setBackgroundColor` because
+`scrot` of the Xvfb framebuffer (`screenshots/linux_xvfb_lit_cube.png`)
+confirms a lit cube on a muted-purple background. The background color
+doesn't exactly match what we passed to `setBackgroundColor` because
 Filament treats it as linear and runs ACES tone-mapping over it — that's
-expected, not a bug in the integration.
+expected, not a bug. Earlier "clear-only" screenshot (no scene content)
+is at `screenshots/linux_xvfb.png` for comparison.
 
 ## Next steps
 
