@@ -33,6 +33,14 @@ This contains a very tiny subset of the Flutter codebase. The original Flutter r
 
 All Dart code runs on the platform thread. No other threading configurations are supported.
 
+### `flutter pub get` fails with "0.0.0-unknown"
+
+The bundled Dart `pub` reads the legacy `{FLUTTER_ROOT}/version` file to detect
+the Flutter SDK version. Upstream's `omitLegacyVersionFile` flag (which stops
+writing that file) is disabled in this fork so the tool writes it itself. If a
+re-merge from upstream flips the flag back on and pub starts reporting
+`0.0.0-unknown`, see [PUB_VERSION_TROUBLESHOOTING.md](./PUB_VERSION_TROUBLESHOOTING.md).
+
 ### Why does this still have Flutter in the name given that most of what makes Flutter, Flutter is gone?
 
 TBH, this is a very experimental project and I don't feel like obsessing over the name is a high priority right now. The compatibility with tooling is a key feature (I don't need to spend a year trying to rewrite the `flutter_tool` from scratch), and eventually, with a lot of luck and motivation, it should be possible to write a `dart:ui` reimplementation and an abstraction layer good enough so that regular Flutter applications could run on top of Flutter Zero with minimal changes.

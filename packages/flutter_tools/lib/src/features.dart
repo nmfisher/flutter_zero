@@ -235,10 +235,22 @@ const swiftPackageManager = Feature(
 
 /// Whether to continue writing the `{FLUTTER_ROOT}/version` legacy file.
 ///
+/// flutter_zero: DISABLED by default (the file *is* written). The bundled Dart
+/// SDK's `pub` solver reads the legacy `{FLUTTER_ROOT}/version` file to detect
+/// the Flutter SDK version. If this feature is enabled, pub resolves the
+/// version as "0.0.0-unknown" and `flutter pub get` fails on every `sdk:`
+/// constraint (e.g. scoped_model requires >=1.24.0). Keeping the flag off lets
+/// the tool write the file via `_ensureLegacyVersionFile`. See
+/// PUB_VERSION_TROUBLESHOOTING.md and project memory
+/// `flutter-pub-version-unknown`.
+///
 /// Tracking removal: <https://github.com/flutter/flutter/issues/171900>.
-const omitLegacyVersionFile = Feature.fullyEnabled(
+const omitLegacyVersionFile = Feature(
   name: 'stops writing the legacy version file',
   configSetting: 'omit-legacy-version-file',
+  master: FeatureChannelSetting(available: true, enabledByDefault: false),
+  beta: FeatureChannelSetting(available: true, enabledByDefault: false),
+  stable: FeatureChannelSetting(available: true, enabledByDefault: false),
   extraHelpText:
       'If set, the file {FLUTTER_ROOT}/version is no longer written as part of '
       'the flutter tool execution; a newer file format has existed for some '
