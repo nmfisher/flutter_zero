@@ -33,6 +33,7 @@ import 'migrations/macos_deployment_target_migration.dart';
 import 'migrations/nsapplicationmain_deprecation_migration.dart';
 import 'migrations/remove_macos_framework_link_and_embedding_migration.dart';
 import 'migrations/secure_restorable_state_migration.dart';
+import 'pbxproj_settings.dart';
 import 'swift_package_manager.dart';
 
 /// When run in -quiet mode, Xcode should only print from the underlying tasks to stdout.
@@ -134,27 +135,23 @@ Future<void> buildMacOS({
   // other Xcode projects in the macos/ directory. Otherwise pass no name, which will work
   // regardless of the project name so long as there is exactly one project.
   final String? xcodeProjectName = xcodeProject.existsSync() ? xcodeProject.basename : null;
-  final XcodeProjectInfo? projectInfo = await globals.xcodeProjectInterpreter?.getInfo(
-    flutterProject.macos,
-    projectFilename: xcodeProjectName,
-    buildDirectory: flutterBuildDir,
-  );
-  final String? scheme = projectInfo?.schemeFor(buildInfo);
-  if (scheme == null) {
-    projectInfo!.reportFlavorNotFoundAndExit();
-  }
-  final String? configuration = projectInfo?.buildConfigurationFor(buildInfo, scheme);
-  if (configuration == null) {
-    throwToolExit('Unable to find expected configuration in Xcode project.');
-  }
 
-  final Map<String, String> buildSettings =
-      await flutterProject.macos.buildSettingsForBuildInfo(
-        buildInfo,
-        scheme: scheme,
-        configuration: configuration,
-      ) ??
-      <String, String>{};
+  // Resolve scheme/configuration/buildSettings. The fast path reads these
+  // directly from project.pbxproj to avoid spawning `xcodebuild -list` and
+  // `-showBuildSettings`, each of which re-resolves the SwiftPM dependency
+  // graph (~0.2-0.7s of fixed overhead per invocation). Flavored builds and any
+  // parse failure fall back to the `xcodebuild` discovery path.
+  final ({String scheme, String configuration, Map<String, String> buildSettings}) discovery =
+      await _resolveXcodeDiscovery(
+    flutterProject: flutterProject,
+    xcodeProject: xcodeProject,
+    xcodeProjectName: xcodeProjectName,
+    flutterBuildDir: flutterBuildDir,
+    buildInfo: buildInfo,
+  );
+  final String scheme = discovery.scheme;
+  final String configuration = discovery.configuration;
+  final Map<String, String> buildSettings = discovery.buildSettings;
 
   // Write configuration to an xconfig file in a standard location.
   await updateGeneratedXcodeProperties(
@@ -295,6 +292,70 @@ Future<void> buildMacOS({
       elapsedMilliseconds: elapsedDuration.inMilliseconds,
     ),
   );
+}
+
+/// Resolves the Xcode scheme, build configuration, and build settings for a
+/// macOS build.
+///
+/// Prefers reading directly from `project.pbxproj` (no `xcodebuild` subprocess)
+/// for the common, non-flavored case. Falls back to `xcodebuild -list` /
+/// `-showBuildSettings` for flavored builds or whenever the fast parse can't
+/// produce a confident result.
+Future<({String scheme, String configuration, Map<String, String> buildSettings})>
+    _resolveXcodeDiscovery({
+  required FlutterProject flutterProject,
+  required Directory xcodeProject,
+  required String? xcodeProjectName,
+  required Directory flutterBuildDir,
+  required BuildInfo buildInfo,
+}) async {
+  // Fast path: parse project.pbxproj directly. Only used for non-flavored
+  // builds, where the scheme is the shared .xcscheme name (e.g. "Runner") and
+  // the configuration is one of Debug/Profile/Release.
+  if (buildInfo.flavor == null) {
+    final String? fastScheme = PbxprojSettings.schemeForProject(xcodeProject);
+    if (fastScheme != null) {
+      final fastConfiguration = buildInfo.isDebug
+          ? 'Debug'
+          : buildInfo.isProfile
+              ? 'Profile'
+              : 'Release';
+      final Map<String, String>? fastSettings = PbxprojSettings.buildSettingsForConfiguration(
+        xcodeProject.childFile('project.pbxproj'),
+        fastConfiguration,
+      );
+      if (fastSettings != null) {
+        return (
+          scheme: fastScheme,
+          configuration: fastConfiguration,
+          buildSettings: fastSettings,
+        );
+      }
+    }
+  }
+
+  // Slow path: ask xcodebuild.
+  final XcodeProjectInfo? projectInfo = await globals.xcodeProjectInterpreter?.getInfo(
+    flutterProject.macos,
+    projectFilename: xcodeProjectName,
+    buildDirectory: flutterBuildDir,
+  );
+  final String? scheme = projectInfo?.schemeFor(buildInfo);
+  if (scheme == null) {
+    projectInfo!.reportFlavorNotFoundAndExit();
+  }
+  final String? configuration = projectInfo?.buildConfigurationFor(buildInfo, scheme);
+  if (configuration == null) {
+    throwToolExit('Unable to find expected configuration in Xcode project.');
+  }
+  final Map<String, String> buildSettings =
+      await flutterProject.macos.buildSettingsForBuildInfo(
+        buildInfo,
+        scheme: scheme,
+        configuration: configuration,
+      ) ??
+          <String, String>{};
+  return (scheme: scheme, configuration: configuration, buildSettings: buildSettings);
 }
 
 /// Performs a size analysis of the AOT snapshot and writes to an analysis file, if configured.

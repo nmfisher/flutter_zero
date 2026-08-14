@@ -132,8 +132,15 @@ class SwiftPackage {
       _swiftPackageTemplate,
       _templateContext,
     );
-    _manifest.createSync(recursive: true);
-    _manifest.writeAsStringSync(renderedTemplate);
+    // Only write the manifest when its contents actually change. An unconditional
+    // rewrite bumps the file mtime on every `flutter pub get`/`build` even when
+    // nothing changed; keeping the mtime stable avoids needless churn for
+    // anything that watches the manifest (and pairs with the preserve-FlutterFramework
+    // logic in SwiftPackageManager to keep incremental Xcode builds truly no-op).
+    if (!_manifest.existsSync() || _manifest.readAsStringSync() != renderedTemplate) {
+      _manifest.createSync(recursive: true);
+      _manifest.writeAsStringSync(renderedTemplate);
+    }
   }
 
   String? _formatPlatforms() {

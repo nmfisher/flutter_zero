@@ -63,8 +63,22 @@ class SwiftPackageManager {
     bool flutterAsADependency = true,
   }) async {
     final Directory symlinkDirectory = project.relativeSwiftPackagesDirectory;
-    ErrorHandlingFileSystem.deleteIfExists(symlinkDirectory, recursive: true);
+    // This directory holds both plugin package symlinks (which may go stale as
+    // the plugin set changes) and the generated FlutterFramework package. Only
+    // remove the former; wiping the whole directory on every `flutter pub get`
+    // / `build` deletes FlutterFramework's generated source and Swift build
+    // products, giving FlutterFramework.swift a fresh mtime and forcing Xcode to
+    // recompile it (and re-link) on every incremental build.
     symlinkDirectory.createSync(recursive: true);
+    if (symlinkDirectory.existsSync()) {
+      for (final FileSystemEntity entity in symlinkDirectory.listSync()) {
+        if (_fileSystem.path.basename(entity.path) ==
+            kFlutterGeneratedFrameworkSwiftPackageTargetName) {
+          continue;
+        }
+        ErrorHandlingFileSystem.deleteIfExists(entity, recursive: true);
+      }
+    }
 
     final (
       List<SwiftPackagePackageDependency> packageDependencies,

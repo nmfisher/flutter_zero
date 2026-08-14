@@ -4,6 +4,7 @@
 
 import 'dart:async';
 
+import 'package:crypto/crypto.dart';
 import 'package:file/memory.dart';
 import 'package:meta/meta.dart';
 import 'package:process/process.dart';
@@ -410,6 +411,17 @@ class XcodeProjectInterpreter {
     bool quiet = true,
     bool waitForCompletion = true,
   }) async {
+    // Fast path: skip the eager `xcodebuild -resolvePackageDependencies` when
+    // Swift packages were already resolved for the current set of generated
+    // Package.swift manifests. That command costs ~0.6s per build because it
+    // re-resolves the SwiftPM graph from scratch; when nothing changed it is
+    // pure overhead, since the subsequent build step re-resolves against the
+    // cached graph with -skipPackageUpdates anyway. `flutter pub get`
+    // regenerates the manifests whenever the dependency/plugin set changes,
+    // which invalidates the stamp below.
+    if (_swiftPackageResolutionIsCurrent(xcodeProject, buildDirectory)) {
+      return;
+    }
     final String projectPath = xcodeProject.hostAppRoot.path;
     Status? status;
     try {
@@ -495,8 +507,70 @@ class XcodeProjectInterpreter {
       if (exitCode != 0) {
         throwToolExit('Xcode failed to resolve Swift Package Manager dependencies:\n$stderrBuffer');
       }
+      // Resolution succeeded for the current manifests; record a stamp so the
+      // next build can skip the eager resolve (see the fast path at the top).
+      _writeSwiftPackageResolutionStamp(xcodeProject, buildDirectory);
     } finally {
       status?.cancel();
+    }
+  }
+
+  /// The stamp file recording the fingerprint of the last successful Swift
+  /// package resolution. Lives inside the build directory so `flutter clean`
+  /// invalidates it.
+  File _swiftPackageResolutionStampFile(Directory buildDirectory) {
+    return buildDirectory.childFile('.flutter-swiftpm-resolved.stamp');
+  }
+
+  /// A fingerprint of the inputs that determine Swift package resolution: the
+  /// generated `Package.swift` manifests. `flutter pub get` regenerates these
+  /// whenever the plugin/dependency set changes, so an unchanged fingerprint
+  /// means resolution is still current. Returns null if the manifests aren't
+  /// present yet (e.g. before the first `pub get`), in which case the fast
+  /// path is skipped.
+  String? _swiftPackageResolutionFingerprint(XcodeBasedProject xcodeProject) {
+    final File pluginManifest = xcodeProject.flutterPluginSwiftPackageManifest;
+    if (!pluginManifest.existsSync()) {
+      return null;
+    }
+    final File frameworkManifest =
+        xcodeProject.flutterFrameworkSwiftPackageDirectory.childFile('Package.swift');
+    final String frameworkContent =
+        frameworkManifest.existsSync() ? frameworkManifest.readAsStringSync() : '';
+    final String pluginContent = pluginManifest.readAsStringSync();
+    return sha1.convert(utf8.encode('$pluginContent\n$frameworkContent')).toString();
+  }
+
+  bool _swiftPackageResolutionIsCurrent(
+    XcodeBasedProject xcodeProject,
+    Directory buildDirectory,
+  ) {
+    final String? fingerprint = _swiftPackageResolutionFingerprint(xcodeProject);
+    if (fingerprint == null) {
+      return false;
+    }
+    final File stamp = _swiftPackageResolutionStampFile(buildDirectory);
+    if (!stamp.existsSync()) {
+      return false;
+    }
+    return stamp.readAsStringSync().trim() == fingerprint;
+  }
+
+  void _writeSwiftPackageResolutionStamp(
+    XcodeBasedProject xcodeProject,
+    Directory buildDirectory,
+  ) {
+    final String? fingerprint = _swiftPackageResolutionFingerprint(xcodeProject);
+    if (fingerprint == null) {
+      return;
+    }
+    final File stamp = _swiftPackageResolutionStampFile(buildDirectory);
+    try {
+      stamp.createSync(recursive: true);
+      stamp.writeAsStringSync(fingerprint);
+    } on FileSystemException {
+      // Best-effort stamp; if it can't be written the next build simply
+      // resolves again.
     }
   }
 

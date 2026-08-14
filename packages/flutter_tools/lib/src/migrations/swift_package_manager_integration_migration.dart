@@ -15,6 +15,7 @@ import '../convert.dart';
 import '../darwin/darwin.dart';
 import '../ios/plist_parser.dart';
 import '../ios/xcodeproj.dart';
+import '../macos/pbxproj_settings.dart';
 import '../macos/swift_package_manager.dart';
 import '../plugins.dart';
 import '../project.dart';
@@ -269,12 +270,35 @@ class SwiftPackageManagerIntegrationMigration extends ProjectMigrator {
   }
 
   Future<SchemeInfo> _getSchemeFile() async {
+    if (_xcodeProject.xcodeWorkspace == null) {
+      throw Exception('Xcode workspace not found.');
+    }
+
+    // Fast path: for non-flavored builds the scheme is the shared .xcscheme
+    // name (e.g. "Runner"), which we can read directly from the project
+    // without spawning `xcodebuild -list`. That command re-resolves the
+    // SwiftPM dependency graph on every invocation (~0.6s of fixed overhead),
+    // and this migration runs on every build even once the project is already
+    // fully migrated. Flavored builds and any scheme/file mismatch fall back
+    // to the `xcodebuild` path below.
+    if (_buildInfo.flavor == null) {
+      final String? fastScheme = PbxprojSettings.schemeForProject(_xcodeProject.xcodeProject);
+      if (fastScheme != null) {
+        final File fastSchemeFile = _xcodeProject.xcodeProjectSchemeFile(scheme: fastScheme);
+        if (fastSchemeFile.existsSync()) {
+          final String schemeContent = fastSchemeFile.readAsStringSync();
+          return SchemeInfo(
+            schemeName: fastScheme,
+            schemeFile: fastSchemeFile,
+            schemeContent: schemeContent,
+          );
+        }
+      }
+    }
+
     final XcodeProjectInfo? projectInfo = await _xcodeProject.projectInfo();
     if (projectInfo == null) {
       throw Exception('Unable to get Xcode project info.');
-    }
-    if (_xcodeProject.xcodeWorkspace == null) {
-      throw Exception('Xcode workspace not found.');
     }
     final String? scheme = projectInfo.schemeFor(_buildInfo);
     if (scheme == null) {
