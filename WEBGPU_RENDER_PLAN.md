@@ -24,6 +24,12 @@ This is a proposal only. No code has been changed.
   directly, e.g. Vello) is a bigger bet. It only pays off if we decide
   Filament is not the 2D answer, and it puts two WebGPU stacks in one
   process if Filament stays for 3D.
+- **No full UI framework fits Flutter Zero** (§4). Makepad has no
+  WebGPU at all; Iced, Bevy UI, Xilem, and Slint are complete toolkits
+  that would own the window and replace our Dart framework. The
+  unified-WebGPU pick, if we want one, is the **Vello + Parley**
+  renderer under the existing `DisplayListExecutor` seam, composed over
+  Filament through the RGBA8 buffer path `thermion_ui` already runs.
 - **Recommended combination:** Filament-on-WebGPU as the single GPU stack
   (Option A, then Option C1), with the UI renderer from
   `UI_RENDERER_PLAN.md` compiled to WGSL instead of MSL/GLSL/SPIR-V.
@@ -294,7 +300,260 @@ swapped without touching Filament.
 | Binary size | +Dawn (measure; tens of MB) | +wgpu (~5 MB) / ~0 hand-rolled | same as A | +wgpu |
 | Browser story | yes (hybrid web variant) | yes (wgpu WASM) | yes | no (readback per frame) |
 
-## 4. The Canvas/DisplayList seam, and the first milestone
+## 4. UI framework WebGPU backend research
+
+Nick asked: of the frameworks listed in `RENDERING.md`, which ones really
+support WebGPU, and could one of them be *the* unified WebGPU UI stack for
+Flutter Zero, sitting next to Filament for 3D? Each candidate was checked
+against its upstream README, docs, or source on 2026-08-15. Facts below
+are **[verified]** (read from the project's own repo/docs this round) or
+**[inferred]** (our judgment, flagged as such).
+
+### The key constraint first: two WebGPU implementations exist
+
+- **Dawn** — Google's C++ WebGPU implementation. This is what Filament's
+  WebGPU backend uses. Thermion links Dawn's `webgpu_dawn` monolith
+  statically into the same `.so` as Filament **[verified, §1]**.
+- **wgpu** — the Rust implementation. On desktop, Rust UI projects use
+  the `wgpu` crate, which compiles to its own GPU layer over
+  Vulkan/Metal/D3D12. `wgpu-native` packages it as a C library exposing
+  the standard `webgpu.h` header **[verified: gfx-rs/wgpu-native README —
+  "a native WebGPU implementation in Rust... bindings are based on the
+  WebGPU-native header"]**.
+
+These two are **different stacks**. A wgpu device and a Dawn device in
+one process cannot share textures, buffers, or a swapchain. There is no
+standard way to pass GPU objects between them. So "UI framework on wgpu
+next to Filament on Dawn" always means one of:
+
+1. **Buffer handoff** — the UI renders into pixels, we copy the pixels to
+   the other stack (CPU copy). This is exactly what `thermion_ui` does
+   today with its software rasterizer. Slow-ish, but proven.
+2. **External memory** — share the underlying OS buffer (IOSurface,
+   DMA-BUF) between stacks. Possible in principle, unsupported by either
+   stack's public API today. Slint's own issue #4499 shows they have not
+   solved rendering into a foreign texture either **[verified: issue
+   title "Feature Request: Adding Slint into a custom renderer",
+   discussing dmabuf conversion as future work]**.
+3. **One stack only** — everything on Dawn, or everything on wgpu. Not
+   possible while Filament brings its own bundled Dawn **[inferred;
+   unless Thermion exposed its Dawn `wgpu::Device`, which it does not
+   today — verified: the device stays inside `WebGPUPlatform`]**.
+
+One useful fact for later: both implementations speak the same standard
+`webgpu.h` C API **[verified for wgpu-native; Dawn defines it by
+construction]**. A hand-rolled Dart executor written against `webgpu.h`
+FFI could talk to either one by loading a different library. That keeps
+the "hand-rolled WGSL renderer" option (§2 B) portable across the two.
+
+### Candidate-by-candidate
+
+Every candidate from `RENDERING.md` was checked.
+
+**Vello** (linebender/vello)
+- WebGPU via `wgpu`; native desktop (macOS/Linux/Windows) plus WASM
+  **[verified: README]**.
+- Explicit `render_to_texture()` API — Vello does not need to own the
+  window **[verified: README shows `renderer.render_to_texture(...)`]**.
+  This matters: it fits *under* our executor seam.
+- Text: Vello itself has none. Its sibling crate Parley is the shaping
+  and layout stack; Xilem and Bevy both use Parley today **[verified:
+  Xilem README links "the Parley text stack"; bevy_text Cargo.toml lists
+  `parley` + `swash`]**.
+- License Apache-2.0 OR MIT; shader files also Unlicense **[verified]**.
+- Very active: v0.10.0 released 2026-08-14 **[verified: releases API]**.
+- No C API. Rust only — we would write and build a small Rust `cdylib`
+  wrapper **[verified: no C API mentioned; inferred: wrapper size ~few
+  hundred lines]**.
+
+**FemtoVG** (femtovg/femtovg)
+- Two backends: wgpu and OpenGL ES2 **[verified: README]**.
+- Real text shaping, and more than expected: the `textlayout` feature
+  pulls `rustybuzz` (a Rust port of HarfBuzz), `unicode-bidi`, and
+  `unicode-segmentation` **[verified: Cargo.toml]**. This is stronger
+  text than `RENDERING.md` credits ("no shaping").
+- License Apache-2.0 OR MIT; active: v0.26.0 released 2026-07-20,
+  commits in August 2026 **[verified]**.
+- No C API, Rust only **[verified]**. NanoVG-style API — simple, fills
+  and strokes, no compute-shader path rendering.
+
+**Makepad** (makepad/makepad)
+- **No WebGPU backend.** Its renderer targets Metal (macOS), DX11
+  (Windows), OpenGL (Linux), and WebGL (browser) through its own
+  abstraction **[verified: README — "compiles to wasm/webGL, osx/metal,
+  windows/dx11 linux/opengl"]**.
+- This corrects `RENDERING.md`, which lists Makepad as "targets `wgpu`".
+  At the source level that claim does not hold today.
+- MIT, active, no tagged releases (rolling development) **[verified]**.
+- No C API **[verified]**. **Disqualified for this purpose** — no
+  WebGPU, and no way to share a backend with Filament.
+
+**Iced** (iced-rs/iced)
+- Two renderers: `iced_wgpu` (Vulkan/Metal/D3D12 — i.e. wgpu on desktop)
+  and `iced_tiny_skia` (CPU fallback) **[verified: README]**.
+- Text via `cosmic-text` 0.19 plus a fork called `cryoglyph`, with
+  `basic-shaping` and `advanced-shaping` feature flags **[verified:
+  workspace Cargo.toml]**.
+- MIT; last release 0.14.0 on 2025-12-07; README still calls it
+  "experimental software" **[verified]**.
+- No C API **[verified]**. It is a full framework with its own widget
+  tree and windowing — it wants to own the window, not sit under our
+  `DisplayListExecutor` **[inferred from architecture]**.
+
+**Bevy UI** (bevyengine/bevy)
+- Renders through `bevy_render`, which depends on `wgpu` v30 with
+  `wgsl`, `metal`, `vulkan`, `dx12` features **[verified: bevy_render
+  Cargo.toml]**. Native desktop, yes.
+- Text: `bevy_text` uses `parley` + `swash` — *not* cosmic-text as often
+  assumed **[verified: bevy_text Cargo.toml]**.
+- MIT OR Apache-2.0; very active: v0.19.1 released 2026-08-13
+  **[verified]**.
+- No C API **[verified]**. It is a full game engine — ECS, assets,
+  scheduling. Embedding "just the UI renderer" means fighting the
+  framework, not using it **[inferred]**.
+
+**Xilem / Druid** (linebender/xilem)
+- Xilem renders with Vello + wgpu and uses Parley/Fontique for text
+  **[verified: README]**. Native desktop target.
+- Explicitly "experimental", no releases on the releases API
+  **[verified]**. Druid is the older, dormant line; Xilem is its
+  successor **[verified: README positions them]**.
+- Apache-2.0; Rust only, no C API **[verified]**.
+- Not usable as a component today; relevant mainly as the reference
+  architecture for Vello + Parley **[inferred]**.
+
+**Slint** (slint-ui/slint)
+- WebGPU path exists, but it is not a first-class "wgpu renderer": the
+  cargo feature is `renderer-femtovg-wgpu` — FemtoVG running on wgpu —
+  plus `unstable-wgpu-29` / `unstable-wgpu-30` flags that expose wgpu
+  APIs **[verified: api/rs/slint Cargo.toml feature list]**. The docs
+  page lists stable renderers as FemtoVG (GL), Skia (GL/Metal/Vulkan/
+  D3D), software, and Qt; the wgpu variant rides on FemtoVG
+  **[verified: docs.slint.dev backends-and-renderers]**. A newer
+  "anyrender" abstraction is in progress in the repo **[verified:
+  internal/renderers directory]**.
+- License is the outlier: GPLv3, a royalty-free license, or a commercial
+  license — *not* a simple permissive license, and the royalty-free tier
+  excludes embedded use **[verified: README]**.
+- Language bindings: Rust, C++, JavaScript, Python **[verified: README]**;
+  the Skia and software renderers have public C++ APIs, the FemtoVG one
+  Rust only **[verified: docs renderer table]**.
+- Active: v1.17.1 released 2026-07-07 **[verified]**.
+- It is a complete UI toolkit with its own markup language and window
+  ownership. Under our seam it does not fit; beside our framework it
+  duplicates everything above the canvas **[inferred]**.
+
+**ThorVG** (thorvg/thorvg)
+- Real WebGPU renderer, treated as a full citizen: "All vector rendering
+  features are fully supported on the WebGPU backend", ~1.8× throughput
+  vs their GL backend **[verified: README]**.
+- Native desktop uses **wgpu-native v29** under the hood; browsers use
+  native WebGPU **[verified: README]**. So: wgpu stack, not Dawn.
+- **Has a C API** — build with `meson -Dbindings="capi"` **[verified:
+  README]**. This is the only candidate with a ready-made C ABI besides
+  Skia.
+- Text: TTF/OTF fonts and multi-line layout are listed, but no HarfBuzz
+  or shaping engine is mentioned **[verified: README; absence of claim]**.
+  Treat shaping as limited **[inferred]**.
+- MIT; active: v1.1.0 released 2026-07-22 **[verified]**.
+
+**Skia Graphite** (google/skia)
+- Graphite's cross-platform GPU path is Dawn — the *same* WebGPU
+  implementation Filament uses. Dawn covers D3D12 (Windows), Vulkan
+  (Linux), Metal (macOS); Graphite first shipped in Chrome on
+  Apple-Silicon/Metal **[verified: Skia announce blog + SkiaSharp
+  Graphite tracking issue; RENDERING.md §ladder]**.
+- Text: full stack bundled (HarfBuzz/FreeType/ICU) — the only candidate
+  where text "just works" **[verified: RENDERING.md; Skia docs]**.
+- License BSD; production code path in Chrome; no releases, rolls with
+  Chrome **[verified]**.
+- C++ API; the C API in `include/c/` is an old subset that does not
+  cover Graphite **[verified: RENDERING.md]** — we would write the same
+  C wrapper §RENDERING describes, ~500–1500 lines for a subset.
+- Same-implementation caveat: Filament bundles its *own* Dawn copy.
+  Two statically-linked Dawn copies still create two separate devices —
+  sharing a device would need a Thermion patch to expose its
+  `wgpu::Device` **[inferred; nothing in the thermion branch exposes
+  it — verified]**. And the cost is the known one: ~100 MB build,
+  "Flutter rendering, externalized" **[verified: RENDERING.md]**.
+
+### Comparison table
+
+| Candidate | Real WebGPU backend? | Native desktop? | wgpu or Dawn? | Text shaping | License | Last release | C API for FFI? | Fits under our Canvas seam? |
+|---|---|---|---|---|---|---|---|---|
+| Vello | yes (wgpu) | yes | wgpu | via Parley (sibling crate) | Apache-2.0 OR MIT | v0.10.0, 2026-08-14 | no — Rust cdylib wrapper | **yes** — `render_to_texture` |
+| FemtoVG | yes (wgpu) | yes | wgpu | yes — rustybuzz + bidi | Apache-2.0 OR MIT | v0.26.0, 2026-07-20 | no — Rust cdylib wrapper | yes — rasterizer-shaped |
+| Makepad | **no** (Metal/DX11/GL/WebGL) | yes | own stack | unverified | MIT | none (rolling) | no | no — owns everything |
+| Iced | yes (wgpu) | yes | wgpu | yes — cosmic-text | MIT | 0.14.0, 2025-12-07 | no | no — full framework |
+| Bevy UI | yes (wgpu 30) | yes | wgpu | yes — parley + swash | MIT OR Apache-2.0 | v0.19.1, 2026-08-13 | no | no — full engine |
+| Xilem | via Vello | yes | wgpu | yes — Parley/Fontique | Apache-2.0 | none (experimental) | no | no — full framework |
+| Slint | via FemtoVG (`renderer-femtovg-wgpu`, unstable flags) | yes | wgpu | present, engine unverified | **GPLv3 / royalty-free / commercial** | v1.17.1, 2026-07-07 | C++ (skia, software renderers) | no — full toolkit |
+| ThorVG | yes (full features, 1.8× vs GL) | yes | **wgpu-native v29** | fonts + line layout, no shaper verified | MIT | v1.1.0, 2026-07-22 | **yes** (`-Dbindings=capi`) | yes — renderer-shaped |
+| Skia Graphite | yes (Dawn) | yes | **Dawn (same as Filament)** | yes — HarfBuzz/ICU bundled | BSD | rolling (Chrome) | partial, old C subset | yes, but heaviest |
+
+wgpu-native itself, for size reference: latest release v29.0.1.1;
+desktop release zips are 13.7 MB (macOS arm64), 16.0 MB (Linux x64),
+15.5–17.1 MB (Windows x64) **[verified: GitHub releases API]**. ThorVG
+and any wgpu-based candidate bring roughly that much plus their own code.
+
+### Recommendation
+
+**No full UI framework is the right pick for Flutter Zero.** All five
+frameworks (Makepad, Iced, Bevy UI, Xilem, Slint) want to own the
+window, the event loop, and the widget tree. Four of them are Rust-only
+with no C API. Slint has C++ bindings but a restrictive license and the
+same ownership problem. Adopting any of them means abandoning the Dart
+framework we are building — which is the point of the project
+**[inferred]**.
+
+**The unified WebGPU UI stack should be a renderer under the seam, and
+the best one is Vello + Parley.** Reasons:
+
+1. It fits the architecture we already have. `RecordingCanvas` emits a
+   `DisplayList`; a `VelloDisplayListExecutor` walks it and calls Vello;
+   Vello renders to a texture **[verified API exists; executor is our
+   code]**. Nothing above the seam changes.
+2. It coexists with Filament today, without GPU interop, through the
+   path `thermion_ui` already runs: Vello renders into its texture, one
+   GPU→CPU copy, upload to the Filament texture, composite View on top.
+   That is option C2 from §2, now with a concrete renderer named. At
+   800×600 this is cheap; measure at target resolution before
+   committing **[inferred]**.
+3. Text comes bundled in practice: Parley (shaping, layout) + swash
+   (rasterization) is the same stack Bevy ships **[verified]**. This
+   closes the biggest gap in `UI_RENDERER_PLAN.md`'s hand-rolled path.
+4. It is the most alive project on the list (released yesterday, at
+   time of writing) with the cleanest license **[verified]**.
+
+**Runner-up: ThorVG.** The only candidate with a ready C API, which
+makes Dart FFI trivial — no Rust wrapper to write or build. MIT,
+active, full WebGPU feature support. Two reasons it is not the pick:
+text shaping is unproven, and it rides on wgpu-native, so it can never
+share a device with Filament's Dawn **[verified wgpu-native dependency;
+shaping unverified]**. Worth a one-day spike if Vello's Rust wrapper
+turns out to hurt.
+
+**Skia Graphite is the only Dawn-native option**, so the only candidate
+that could ever share a GPU device with Filament (after a Thermion
+patch to expose the device). It also solves text completely. It loses
+on size (~100 MB) and on the "we just rebuilt Flutter" problem
+`RENDERING.md` names. Keep it as the escape hatch if quality demands
+it, not the plan **[inferred from RENDERING.md's analysis]**.
+
+**Correction to `RENDERING.md`:** Makepad is listed there as a wgpu
+target; per its own README it is not. The WebGPU-framework shortlist is
+effectively Iced, Bevy UI, Xilem, and Slint — and none of them fit
+under our seam.
+
+**Impact on this plan's recommendation: none at the top level.** §2's
+sequencing stands: milestone 1 (Filament on Dawn), then C1 (WGSL UI
+materials). What this research adds is a sharper C2: if the
+hand-rolled UI renderer stalls, the named replacement is Vello + Parley
+behind the existing executor interface — buffer-level first, per-frame
+copy into the Filament texture, GPU interop deferred until either stack
+grows external-memory support.
+
+## 5. The Canvas/DisplayList seam, and the first milestone
 
 The seam is already right, and this is the main reason the proposal is
 cheap. `RecordingCanvas` produces a `DisplayList`; a
@@ -342,7 +601,7 @@ later decision (C1 vs C2, Linux timing, whether to keep Metal as the
 default) depends on those answers, so nothing bigger should be
 scheduled before it.
 
-## 5. Risks, open questions, prototype order
+## 6. Risks, open questions, prototype order
 
 ### Risks
 
@@ -412,11 +671,18 @@ scheduled before it.
 - `UI_BRAINSTORMING.md` — threading model and frame-scheduler seam.
 - thermion `asb/webgpu` (PR #242) — everything in §1; `docs/upstream.md`
   on that branch is the canonical writeup of the blitter bug.
+- §4 candidate facts were read from each project's README, docs, or
+  source on 2026-08-15: linebender/vello, femtovg/femtovg,
+  makepad/makepad, iced-rs/iced, bevyengine/bevy (`bevy_render` +
+  `bevy_text` Cargo.tomls), linebender/xilem, slint-ui/slint
+  (backends-and-renderers docs + `api/rs/slint/Cargo.toml`),
+  thorvg/thorvg, gfx-rs/wgpu-native, plus Skia's Graphite announcement
+  and SkiaSharp's Graphite tracking issue.
 
 ## Updating this plan
 
 When milestone 1 lands, replace the effort estimates and open questions
-in §5 with measured numbers, record the binary-size delta, and decide
+in §6 with measured numbers, record the binary-size delta, and decide
 C1 vs C2 based on whether the matc/WGSL path for our own materials
 worked. If we abandon WebGPU, note why here — the same seam makes the
 next backend swap just as cheap.
