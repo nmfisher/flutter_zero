@@ -24,12 +24,19 @@ This is a proposal only. No code has been changed.
   directly, e.g. Vello) is a bigger bet. It only pays off if we decide
   Filament is not the 2D answer, and it puts two WebGPU stacks in one
   process if Filament stays for 3D.
-- **No full UI framework fits Flutter Zero** (§4). Makepad has no
+- **No full UI framework fits under our seam** (§4). Makepad has no
   WebGPU at all; Iced, Bevy UI, Xilem, and Slint are complete toolkits
   that would own the window and replace our Dart framework. The
-  unified-WebGPU pick, if we want one, is the **Vello + Parley**
-  renderer under the existing `DisplayListExecutor` seam, composed over
-  Filament through the RGBA8 buffer path `thermion_ui` already runs.
+  unified-WebGPU pick for a *renderer under the seam* is **Vello +
+  Parley**, composed over Filament through the RGBA8 buffer path
+  `thermion_ui` already runs.
+- **If we adopt a whole widget framework instead** (window ownership
+  allowed, §5): **GPUI is out** — its wgpu renderer is Linux-only;
+  macOS is hard-wired to Metal, Windows to DirectX. The retained pick
+  is **Floem** (wgpu, MIT, needs a Rust cdylib wrapper). The pragmatic
+  pick is **Dear ImGui on Dawn** — the only widget stack that can sit
+  on Filament's Dawn, has a C ABI (cimgui + small shim), and ships an
+  SDL3 platform backend. Immediate mode, but everything else fits.
 - **Recommended combination:** Filament-on-WebGPU as the single GPU stack
   (Option A, then Option C1), with the UI renderer from
   `UI_RENDERER_PLAN.md` compiled to WGSL instead of MSL/GLSL/SPIR-V.
@@ -553,7 +560,285 @@ behind the existing executor interface — buffer-level first, per-frame
 copy into the Filament texture, GPU interop deferred until either stack
 grows external-memory support.
 
-## 5. The Canvas/DisplayList seam, and the first milestone
+## 5. Widget framework on a WebGPU backend
+
+New requirements from Nick, which change the question this plan asks:
+
+- The framework **may own its window**. Windowing is not a blocker.
+- It may bring its own renderer, but that renderer **must run on WebGPU
+  natively** on desktop (wgpu or Dawn) — not just WASM.
+- We will write Dart FFI bindings ourselves if there is a C ABI, or a
+  small C shim / Rust cdylib if not.
+- **Retained-mode preferred.** Immediate-mode acceptable if nothing
+  retained fits.
+- Small and fast preferred. Permissive license strongly preferred.
+
+So the question becomes: is there a widget framework we can *adopt*,
+rather than building widgets in Dart over a renderer? §4 concluded "no
+full framework fits" — but that was under the old constraint that the
+framework had to sit under our `DisplayListExecutor`. With window
+ownership allowed, the field reopens. Everything below was checked
+against upstream source on 2026-08-16. Claims are **[verified]** (read
+from the project's repo/docs this round) or **[inferred]**.
+
+### 5.1 GPUI deep-dive (Nick's hunch)
+
+The zed repo splits GPUI into many crates: `gpui` (core), `gpui_platform`
+(selector), `gpui_macos`/`gpui_apple`, `gpui_windows`, `gpui_linux`,
+`gpui_web`, and — the one that matters here — **`gpui_wgpu`**
+**[verified: repo crate listing]**.
+
+**Does GPUI render via wgpu on native desktop?** Partly:
+
+- **Linux: yes.** Both the X11 and Wayland window implementations
+  construct `gpui_wgpu::WgpuRenderer::new(...)` for every window
+  **[verified: `crates/gpui_linux/src/linux/x11/window.rs:733` and
+  `.../wayland/window.rs:574`]**. `gpui_wgpu` is a real wgpu renderer:
+  wgpu dependency, WGSL shader files (including a storage-buffer and a
+  WebGL variant), a sprite atlas, and a cosmic-text 0.19 text system
+  **[verified: `gpui_wgpu/Cargo.toml` + src listing]**.
+- **macOS: no.** macOS uses `gpui_apple::metal_renderer::MetalRenderer`
+  — literally `pub type Renderer = MetalRenderer;` **[verified:
+  `crates/gpui_apple/src/metal_renderer.rs:45`]**. Direct Metal, no
+  wgpu, no WebGPU.
+- **Windows: no.** `gpui_windows` has `directx_renderer.rs`,
+  `directx_devices.rs`, `direct_write.rs`, and HLSL shaders — Direct3D
+  + DirectWrite **[verified: crate file listing]**.
+- **Web: yes.** `gpui_web` compiles `gpui_wgpu` for wasm with a WebGL
+  fallback feature **[verified: `gpui_wgpu/Cargo.toml` wasm deps]**.
+
+**Is the renderer pluggable?** No. There is no runtime "Renderer" trait
+with selectable implementations. The seam is the `Platform` /
+`PlatformWindow` trait, and each platform crate hard-wires its renderer
+at compile time (Linux→wgpu, macOS→Metal, Windows→DirectX)
+**[verified structurally: each platform constructs its own renderer;
+no shared renderer trait exists in `gpui/src/platform.rs`]**. The
+`gpui_wgpu` crate itself has no OS gates — only wasm/non-wasm — so in
+principle it could be compiled for macOS or Windows, but you would have
+to write your own `Platform` implementation to use it there
+**[inferred]**. The direction of travel is clearly toward wgpu
+everywhere (a new wgpu crate, web on wgpu, `// todo("windows")` markers
+in the code **[verified: `gpui/src/scene.rs:2`]**), but it is not there
+today.
+
+**Is GPUI usable as a library outside Zed?** Half-yes:
+
+- `gpui` is on crates.io as 0.2.2, last updated 2025-10-22 — it lags
+  the repo **[verified: crates.io API]**.
+- `gpui_wgpu` is **not on crates.io** at all **[verified]**. Using the
+  wgpu renderer means a git dependency on the whole zed repo.
+- The crate ships examples (`animation.rs`, `data_table.rs`,
+  `drag_drop.rs`, `gradient.rs`, …) **[verified:
+  `crates/gpui/examples`]**, so it is not purely Zed-internal.
+- No API stability promise; Zed develops it for Zed first **[inferred]**.
+- The `gpui.rs` website could not be fetched from this container (403);
+  not verified.
+
+**gpui-base / gpui-component (Longbridge):** both live in
+`longbridge/gpui-component`, Apache-2.0, active (pushed 2026-08-16,
+12.8k stars). `gpui-component` 0.5.1 released 2026-02-05;
+`gpui-base` 0.1.0 released 2026-08-11 **[verified: crates.io +
+GitHub API]**. They inherit GPUI's platform story unchanged: on macOS
+they render through Metal, not WebGPU **[inferred: they call GPUI]**.
+Note: GPUI's rendering input is a `Scene` type (paths, shadows,
+sprites — a display list in all but name **[verified:
+`gpui/src/scene.rs`]**), which is architecturally close to our
+`DisplayList`. But `Scene` is a Rust type with no C ABI.
+
+**Driving GPUI from Dart:** GPUI's API is closure- and entity-based
+Rust (`AppContext`, `cx.spawn`, `Window` callbacks). There is no C ABI.
+The only realistic shape is a Rust cdylib that owns the entire GPUI app
+and exposes a small message-passing surface to Dart. That inverts the
+project: the UI lives in Rust, Dart becomes the host. Binding surface
+would be large and unstable **[inferred]**.
+
+**VERDICT: No — GPUI cannot be our WebGPU widget framework today.**
+The wgpu path is real but Linux-only; macOS is baked to Metal and
+Windows to DirectX; the renderer is not swappable without forking
+platform crates; and the Dart binding cost is the highest of any
+candidate. Revisit if Zed finishes the wgpu-everywhere migration —
+`gpui_wgpu` existing at all says that is where they are going
+**[inferred]**.
+
+### 5.2 Missed candidates, verified
+
+Searched systematically (GitHub topic/keyword search for "wgpu gui
+framework" plus direct checks of every name suggested). The GitHub
+search surfaced only small projects (<350 stars, most started in 2026)
+**[verified]**. The established ones:
+
+**Dear ImGui** (ocornut/imgui)
+- `imgui_impl_wgpu` ships in the main repo **[verified:
+  `backends/imgui_impl_wgpu.{h,cpp}`]**. It is written against the
+  **standard `webgpu.h` C API** and requires exactly one of three
+  defines: `IMGUI_IMPL_WEBGPU_BACKEND_DAWN`, `..._WGPU`
+  (wgpu-native), or `..._WGVK` (a native Vulkan-based WebGPU, added
+  2026-03, SPIR-V shaders) **[verified: header + changelog]**. Dawn
+  support has been maintained since 2024-10 **[verified: changelog]**.
+- It renders into a **caller-owned render pass**:
+  `ImGui_ImplWGPU_RenderDrawData(ImDrawData*, WGPURenderPassEncoder)`,
+  initialized with `ImGui_ImplWGPU_InitInfo { WGPUDevice,
+  RenderTargetFormat, ... }` **[verified: header]**. So it renders
+  into any texture on any device we create — it does not need to own
+  the swapchain.
+- Platform backend for **SDL3** exists (`imgui_impl_sdl3`)
+  **[verified: backends listing]**.
+- C ABI: the core has one via **cimgui** (MIT, active), which also
+  wraps the SDL2/SDL3/GLFW/OpenGL/Vulkan backends — but **not** the
+  wgpu backend **[verified: `cimgui_impl.h` defines list — no
+  `CIMGUI_USE_WGPU`]**. We would write a ~50–100 line C shim over
+  `ImGui_ImplWGPU_*` and link it beside cimgui **[inferred: size]**.
+- Immediate mode. MIT. Very active: v1.92.9b released 2026-07-31
+  **[verified: releases API]**. Small: core+backends compile to a few
+  hundred KB **[inferred]**.
+- Text: rasterizes glyphs itself (stb_truetype by default, FreeType
+  optional, dynamic font atlas added recently). No complex-script
+  shaping **[inferred from docs/features]**.
+
+**egui** (emilk/egui)
+- `egui-wgpu` is an official crate, "bindings for using egui natively
+  using the wgpu library", 0.36.1 released 2026-08-07 **[verified:
+  crates.io]**. Immediate mode. Rust only — no C API **[verified]**.
+  Apache-2.0 (repo license) **[verified: GitHub API]**.
+- Mature (used in production by Rerun and others), but for us it has
+  the same cdylib-wrapper cost as every Rust option, on top of an
+  immediate-mode model that duplicates what our own widget layer is
+  for **[inferred]**.
+
+**Floem** (lapce/floem)
+- Retained-mode ("the view tree is constructed only once"), native
+  Windows/macOS/Linux, GPU rendering through **wgpu** via `vger` or
+  `vello`, plus an AnyRender Skia option and a `tiny-skia` CPU
+  fallback **[verified: README]**. MIT **[verified]**.
+- Maturing: README warns of "occasional breaking changes" pre-1.0
+  **[verified]**. Last tagged release v0.2.0 in 2024-11; repo pushes
+  through 2026-06 **[verified: GitHub API]** — alive, slow release
+  cadence.
+- No C API **[verified]**. Rust cdylib wrapper required.
+
+**Dioxus / Blitz** (DioxusLabs/blitz)
+- Blitz is an HTML/CSS rendering engine (Servo's Stylo for CSS) that
+  renders via **Vello** (`blitz-renderer-vello`), with `blitz-shell`
+  (winit) for native windowing; `dioxus-native` is the Dioxus frontend
+  on top **[verified: README]**. Native desktop builds exist
+  (Win/mac/Linux) **[verified]**.
+- Beta: "usable for making apps if you are an early adopter", "many
+  bugs and missing features" **[verified: README]**. Active (pushed
+  2026-08-15). Apache-2.0/MIT dual, with one MPL-2.0 crate (stylo
+  interop) **[verified]**. No C API **[verified]**.
+- It is an HTML/CSS engine, not a widget toolkit — adopting it means
+  writing UI in HTML/CSS, and Dioxus (RSX) for logic. Big departure
+  from a Dart widget tree **[inferred]**.
+
+**Vizia** (vizia/vizia) — **excluded.** The README says rendering
+"leverages the powerful and robust skia library" — it moved off
+femtovg to Skia **[verified: README]**. No native WebGPU backend of
+its own (the WebGPU route would be the Skia-Graphite-Dawn build, §4).
+MIT, 0.4.0 released 2026-04-23, pushed 2026-08-13 **[verified]**.
+
+**Freya** (marc2332/freya) — **excluded.** Now "powered by Skia"
+**[verified: repo description]**. Not WebGPU.
+
+**RmlUi** (mikke89/RmlUi) — **excluded.** HTML/CSS C++ library, no
+WebGPU backend found in its README **[verified: grep, absence]**.
+
+Recalled from §4 (not re-researched): Slint (wgpu via
+`renderer-femtovg-wgpu`, license problem), Xilem (Vello, experimental,
+no releases), ThorVG (renderer with C API, on wgpu-native — Dart
+bindings exist per earlier work in this thread, but not for the WebGPU
+backend **[prior conversation, unverified this round]**), Skia
+Graphite (Dawn, ~100 MB).
+
+### 5.3 Comparison table
+
+| Framework | Mode | Native desktop WebGPU? | Which impl | C ABI? | License | Last release | Size | Text shaping |
+|---|---|---|---|---|---|---|---|---|
+| **Dear ImGui** | immediate | yes | **Dawn, wgpu-native, or WGVK — pick at compile** | core via cimgui; wgpu backend needs ~50-line shim | MIT | v1.92.9b, 2026-07-31 | ~100s KB [inferred] | rasterization only, no shaping |
+| **egui** | immediate | yes | wgpu | no — cdylib | Apache-2.0 | 0.36.1, 2026-08-07 | few MB [inferred] | none |
+| **Floem** | **retained** | yes | wgpu (vger/vello) | no — cdylib | MIT | v0.2.0, 2024-11 (pushed 2026-06) | ~wgpu + renderer [inferred] | yes (own stack, unverified which) |
+| **Blitz (Dioxus)** | retained (HTML/CSS) | yes | wgpu (Vello) | no — cdylib | Apache-2.0/MIT (+1 MPL crate) | none tagged; beta | large (Stylo) [inferred] | yes (browser-grade CSS text) |
+| **GPUI** | retained | **Linux only** | wgpu (macOS=Metal, Windows=DirectX, baked) | no — closure-heavy Rust | Apache-2.0 | 0.2.2, 2025-10 (lags repo) | large [inferred] | yes (cosmic-text) |
+| Slint | retained | yes (unstable feature) | wgpu (via FemtoVG) | C++ (skia/software only) | **GPLv3 / royalty-free / commercial** | v1.17.1, 2026-07-07 | few MB [inferred] | yes |
+| Vizia | retained | **no** (Skia) | — | no | MIT | 0.4.0, 2026-04 | — | — |
+| Freya | retained | **no** (Skia) | — | no | MIT | — | — | — |
+| Xilem | retained | via Vello | wgpu | no | Apache-2.0 | none (experimental) | — | Parley |
+
+### 5.4 Recommendation
+
+**Split the answer by what "use a framework" means for us.**
+
+**1. The pragmatic pick today: Dear ImGui on Dawn.**
+It is the only candidate that satisfies every hard requirement at once:
+
+- Native WebGPU on desktop, and it can sit on **Dawn — the same WebGPU
+  implementation Filament bundles** **[verified]**. No other widget
+  framework can (everything Rust is wgpu; Slint is wgpu; GPUI is
+  Metal/DirectX outside Linux).
+- It has a C ABI story today: cimgui for the core, a ~50-line shim for
+  `ImGui_ImplWGPU_*` **[verified cimgui gap; inferred shim size]**.
+- It has an official **SDL3 platform backend** — the same SDL3 Flutter
+  Zero already runs **[verified]**. Input plumbing is solved, not
+  written.
+- It renders into a caller-owned render pass on a device we create
+  **[verified]**, so integration with Filament has two clean shapes:
+  - **ImGui over Filament, same window:** Filament renders 3D to the
+    swapchain, then an ImGui pass encodes into the same swapchain
+    texture, then present. Requires exposing Filament's Dawn device
+    (or a second Dawn device + external memory) — see open questions.
+  - **ImGui in a texture, composited by Filament:** ImGui renders to
+    an offscreen texture, one readback, upload as a Filament texture —
+    the exact path `thermion_ui` already runs **[verified pattern]**.
+- MIT, tiny, fast, very actively maintained **[verified]**.
+
+Costs, stated plainly: immediate mode (Nick's second choice), "dev
+tool" visual identity out of the box, no complex-script shaping, and
+the UI would be written against ImGui's retained-state immediate API
+from Dart — which does **not** go through our `DisplayList` seam. It
+replaces the widget layer for whatever surface uses it. Best fit: HUDs,
+debug overlays, tool panels around a Filament viewport — the same niche
+ImGui holds in every game engine **[inferred]**.
+
+**2. The retained pick, if we accept the Rust wrapper: Floem.**
+The only retained-mode, permissively-licensed, native-wgpu framework
+that is a real toolkit (not a research project) **[verified]**. Costs:
+Rust cdylib wrapper (~1–2 weeks **[inferred]**), wgpu stack — so no
+sharing with Filament's Dawn, interop via buffer handoff only; pre-1.0
+with breaking changes; releases lag (last tag Nov 2024). It owns its
+window (winit), which the new requirements allow.
+
+**3. GPUI: no.** See §5.1 verdict.
+
+**4. If we want retained + WebGPU + library-grade and can wait:** watch
+Slint's wgpu renderer stabilizing (license still blocks permissive use)
+and Xilem shipping releases. Neither is usable for us today
+**[verified statuses]**.
+
+**5. wgpu vs Dawn, restated for this section.** Of everything checked,
+exactly two widget-ish stacks can run on Dawn: Dear ImGui (compile-time
+flag, standard `webgpu.h`) and Skia Graphite. Every Rust framework is
+wgpu. So the coexistence story with Filament is:
+
+| Stack under the UI | Shares Filament's Dawn? | Interop path |
+|---|---|---|
+| ImGui on Dawn | same implementation, but Filament does not expose its device — second Dawn copy or Thermion patch | same-pass or texture-composite (§5.4.1) |
+| Anything on wgpu | no | RGBA8 buffer handoff (proven in `thermion_ui`) |
+
+The cheapest real unlock for tight coexistence would be a small
+Thermion patch: export Filament's Dawn `WGPUDevice`/queue (or accept an
+external one) through the C API. Then an ImGui-on-Dawn layer could
+encode directly after Filament's pass on the same swapchain. That patch
+is speculative until milestone 1 lands **[inferred]**.
+
+**6. Impact on the plan's recommendation.** None at the top. Milestone
+1 (Filament on Dawn) and C1 (WGSL UI materials) stay the path for the
+*product* UI. What this section adds: (a) GPUI is out, with evidence;
+(b) if Nick wants an adopted framework rather than built widgets, the
+answer is **Floem for retained** (accept the wrapper and the wgpu
+split) or **Dear ImGui on Dawn for immediate** (cheapest binding, only
+Dawn-compatible option, SDL3 done). And the earlier conclusion in §4
+stands for renderers under our seam: Vello remains the pick there.
+
+## 6. The Canvas/DisplayList seam, and the first milestone
 
 The seam is already right, and this is the main reason the proposal is
 cheap. `RecordingCanvas` produces a `DisplayList`; a
@@ -601,7 +886,7 @@ later decision (C1 vs C2, Linux timing, whether to keep Metal as the
 default) depends on those answers, so nothing bigger should be
 scheduled before it.
 
-## 6. Risks, open questions, prototype order
+## 7. Risks, open questions, prototype order
 
 ### Risks
 
@@ -678,11 +963,16 @@ scheduled before it.
   (backends-and-renderers docs + `api/rs/slint/Cargo.toml`),
   thorvg/thorvg, gfx-rs/wgpu-native, plus Skia's Graphite announcement
   and SkiaSharp's Graphite tracking issue.
+- §5 facts were read on 2026-08-16 from the zed repo (sparse clone of
+  `crates/gpui*` at `main`), ocornut/imgui `backends/imgui_impl_wgpu.*`
+  and cimgui's `cimgui_impl.h`, lapce/floem and DioxusLabs/blitz
+  READMEs, vizia/vizia and marc2332/freya repo descriptions, and the
+  crates.io / GitHub releases APIs for version dates.
 
 ## Updating this plan
 
 When milestone 1 lands, replace the effort estimates and open questions
-in §6 with measured numbers, record the binary-size delta, and decide
+in §7 with measured numbers, record the binary-size delta, and decide
 C1 vs C2 based on whether the matc/WGSL path for our own materials
 worked. If we abandon WebGPU, note why here — the same seam makes the
 next backend swap just as cheap.
