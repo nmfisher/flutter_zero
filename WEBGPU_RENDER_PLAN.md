@@ -980,7 +980,8 @@ in both — §4's conclusion stands.
 ### 6.3 Integration options
 
 #### Option A — headless Blitz → RGBA8 buffer → Filament texture
-*(recommended first step)*
+*(recommended first step; the composite anatomy — how the overlay View,
+the swapchain, and the texture fit together — is §6.4)*
 
 Same shape as the pipeline `thermion_ui` already runs: something produces
 RGBA8 pixels, we upload them as a Filament texture, and composite the UI
@@ -1143,7 +1144,141 @@ Link: message passing (Dart FFI → Rust mailbox; Rust → Dart via a
 - **Where it fits:** a second window (a debugger, an inspector, a
   web-content panel) is the honest use case **[inferred]**.
 
-### 6.4 Comparison
+### 6.4 Composite architecture: Filament swapchain + UI on top
+
+Nick's question: how does it actually work when thermion (Filament)
+renders into the window swapchain and we draw the UI on top? Short
+answer: **two Filament Views, one swapchain, UI pixels from Blitz's CPU
+buffer.** Almost all of it already runs in `examples/thermion_ui` today.
+
+```
+SDL3 window (one native handle: CAMetalLayer on macOS, X11 Window on Linux)
+  └─ Filament SwapChain (created from that handle; Dawn presents)
+       ├─ View 0 — renderOrder 0 — the 3D scene
+       │     lights, meshes, PBR. Renders into the swapchain image.
+       │
+       ├─ View 1 — renderOrder 1 — the UI overlay
+       │     orthographic camera → fullscreen quad (NDC [-1,1]²)
+       │     unlit ubershader, AlphaMode.BLEND
+       │     baseColorMap = the UI texture (RGBA8)
+       │     View blend mode: transparent, post-processing off
+       │     → drawn on top of View 0's output
+       │
+       └─ Filament composites both views into the swapchain image in
+          renderOrder and presents ONCE per frame.
+
+UI texture contents (Blitz, option A — CPU only, no window):
+  HTML/CSS DOM
+    → HtmlDocument::from_html → resolve(t) → paint_scene     [Rust cdylib]
+    → render_to_buffer (vello_cpu) → RGBA8 bytes              no wgpu
+    → Texture.setImage(bytes)                                 one upload/frame
+```
+
+**The model, verified in code.** `examples/thermion_ui` creates the UI
+overlay exactly as the diagram says
+(`examples/thermion_ui/lib/src/filament_executor.dart`, landed in commit
+`e148b50472d` "UI overlay on top of 3D via second View at renderOrder: 1")
+**[verified]**:
+
+- One `SwapChain` from the SDL3 window handle; the 3D View attaches at the
+  default order (0), the UI View attaches to the **same** SwapChain with
+  `renderManager.attach(uiView, swapChain, renderOrder: 1)` **[verified]**.
+- The UI View: its own `Scene` holding one fullscreen quad, an
+  orthographic camera (`-1..1`), `BlendMode.transparent`, post-processing
+  off **[verified]**.
+- The quad's material: unlit ubershader, `hasBaseColorTexture`,
+  `AlphaMode.BLEND`, `baseColorMap` = our RGBA8 `Texture` **[verified]**.
+- Filament renders View 0, then View 1 on top, then presents once. One
+  present, one GPU stack, no second window **[verified: the example
+  renders the cube behind and the HUD on top in one `render()` call]**.
+
+**Where the UI pixels come from.** Blitz runs headless — the §6.3 option A
+chain: `from_html → resolve(t) → paint_scene → render_to_buffer` → RGBA8
+bytes on the CPU **[verified, §6.1]**. Dart uploads them with
+`Texture.setImage(0, bytes, w, h, RGBA, UBYTE)` per frame; Filament
+re-samples the texture through the quad's UVs, so the GPU does any scaling
+**[verified upload call]**. Dirty-region optimization: when nothing
+changed — no input event, no CSS animation — skip the re-render *and* the
+re-upload entirely. Filament re-composites the resident texture at
+near-zero cost **[inferred: re-sampling an already-uploaded texture is
+cheap; the composite pass itself still runs each frame while the 3D scene
+animates]**. Blitz's own gate is the precedent: `blitz-shell` only requests
+another frame while the document `is_animating()` **[verified, §6.1]**.
+And because the CPU renderer path is used, **wgpu never enters the
+process** — Filament's Dawn stays the only WebGPU implementation
+**[verified the CPU renderer needs no GPU; single-stack claim follows]**
+(§6.2).
+
+**What changes vs `thermion_ui` today: only the source of the bytes.**
+
+| | `thermion_ui` today | with Blitz (option A) |
+|---|---|---|
+| UI authoring | Dart code → `RecordingCanvas` → `DisplayList` | HTML + CSS |
+| Rasterizer | pure-Dart software rasterizer (executor loop) | Blitz CPU renderer (vello_cpu) in the cdylib |
+| Bytes | `Uint8List` built in Dart | RGBA8 buffer from `blitz_render` (borrowed → one copy) |
+| Upload | `Texture.setImage` each frame | same call, same format |
+| Texture, quad, overlay View, blend, `renderOrder` | — | **unchanged** |
+
+The Filament side is untouched. The swap happens above it: what produces
+the RGBA8 bytes changes from our rasterizer to Blitz. (The
+`DisplayList` seam survives beside this, as §6.3 said — Dart-drawn UI can
+still go through it; Blitz is an alternative producer of bytes, not a new
+executor.)
+
+**The details.**
+
+- **Alpha.** `AlphaMode.BLEND` emits per-fragment alpha, so transparent UI
+  pixels let the 3D scene show through — the translucent HUD panel in the
+  demo does exactly this **[verified]**. The **`baseColorFactor` gotcha**
+  **[verified, and load-bearing]**: the ubershader's fragment color is
+  `baseColorTexture × baseColorFactor`, and the factor defaults to
+  `(0, 0, 0, 0)` — without `setBaseColorFactor(1, 1, 1, 1)` every UI pixel
+  renders as transparent black. The executor's comment calls this
+  "load-bearing, not cosmetic."
+- **Input.** SDL events are polled on the platform thread, translated to
+  `UiEvent`, and passed to `doc.handle_ui_event(...)` — same thread, no
+  marshalling **[verified API, §6.1]**. Hit-testing is Blitz's job, and it
+  is DOM-aware: it knows which element is under the cursor (`:hover`,
+  click targets). The hit-test surface exists:
+  `Document::set_hover_to(x, y) -> bool`, `get_hover_node_id()`, and the
+  event driver's `handle_pointer_move` returns the `NodeId` under the
+  pointer **[verified in blitz-dom]**. Routing policy: the overlay owns
+  the pointer while it is over interactive UI; otherwise the event falls
+  through to the 3D scene (camera orbit today) **[inferred policy]**. One
+  wrinkle: `handle_ui_event` returns nothing (unit type **[verified
+  signature]**), so "did the UI consume this?" must come from a separate
+  hover query the shim adds — small, but it is shim work, not free.
+- **Sizing.** The UI texture is created at window size (`createTexture(w,
+  h, RGBA8)`) **[verified]**. On resize: recreate the texture (Filament
+  textures are fixed-size; `setImage` cannot grow one), set both view
+  viewports, and call `blitz_set_viewport` on the Blitz side **[inferred —
+  the example never resizes; the executor fixes width/height at creation]**.
+- **Perf profile.** One CPU copy per frame: Blitz's buffer → `setImage`
+  (§6.3's stated cost). Milestone B2 (§6.6) measures whether the CPU
+  renderer holds 60 Hz. The fallback ladder, cheapest first: (1) re-render
+  only when dirty — a static HUD skips nearly every frame; (2) smaller UI
+  texture or partial uploads; (3) the wgpu GPU renderer — last resort,
+  because it breaks the single-GPU-stack property **[inferred ordering]**.
+
+**The GPU-rendered alternative, for contrast.** Drawing the UI directly on
+the GPU into the same swapchain (ImGui-on-Dawn is the example, §5) requires
+a thermion patch: expose Filament's internal `wgpu::Device` (and queue,
+and the swapchain's current texture) so the UI pass can encode *after*
+Filament's pass, on the same device, into the same swapchain image. Today
+that device stays private inside `WebGPUPlatform` **[verified, §1]**; with
+no patch, a second Dawn or wgpu instance cannot touch Filament's swapchain
+at all — no device sharing between implementations (§4). The texture-quad
+route avoids the entire problem: the only thing it needs from Filament is
+"sample a texture and alpha-blend a quad," which is public API.
+
+**Bottom line.** "Thermion renders the window, UI on top" = **View 0 (3D)
++ View 1 (UI quad) in one swapchain, UI pixels from Blitz's CPU buffer.**
+About 90% of it already exists in `thermion_ui` **[verified: the entire
+overlay path is `filament_executor.dart`, commit `e148b50472d`]**. The
+remaining work is the Blitz cdylib shim that feeds the texture —
+milestones B1–B3 in §6.6.
+
+### 6.5 Comparison
 
 | | A: buffer handoff | B: wgpu surface on our window | C: own window |
 |---|---|---|---|
@@ -1156,7 +1291,7 @@ Link: message passing (Dart FFI → Rust mailbox; Rust → Dart via a
 | Event loop owner | ours (unchanged) | ours; present blocks | winit |
 | DisplayList seam | beside it (kept) | replaced for this window | untouched |
 
-### 6.5 Milestones
+### 6.6 Milestones
 
 Ordered; each produces a runnable thing. Estimates are for one engineer,
 assuming the thermion WebGPU artifact from §1 is already usable.
@@ -1189,7 +1324,7 @@ assuming the thermion WebGPU artifact from §1 is already usable.
    wanted, prototype C-process (separate process + pipe) as a debug tool
    only.
 
-### 6.6 Risks and open questions
+### 6.7 Risks and open questions
 
 Risks:
 
@@ -1233,7 +1368,7 @@ Open questions:
 7. macOS HiDPI: viewport scale vs. buffer size — does Blitz give us the
    physical-pixel buffer we want for `Texture.setImage`?
 
-### 6.7 What this does to the rest of the plan
+### 6.8 What this does to the rest of the plan
 
 - **§2/§7 unchanged.** Option A (thermion WebGPU) and the first milestone
   are still the opening moves. Blitz does not replace them; it rides the
@@ -1396,6 +1531,6 @@ in §8 with measured numbers, record the binary-size delta, and decide
 C1 vs C2 based on whether the matc/WGSL path for our own materials
 worked. When §6's milestones B1–B2 land, record the Blitz render time,
 the copy cost, and whether the CPU renderer held 60 Hz — that number
-decides B4 (wgpu renderer) and closes §6.6's first three questions. If
+decides B4 (wgpu renderer) and closes §6.7's first three questions. If
 we abandon WebGPU, note why here — the same seam makes the next backend
 swap just as cheap.
