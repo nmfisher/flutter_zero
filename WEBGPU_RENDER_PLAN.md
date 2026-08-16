@@ -1,11 +1,16 @@
 # WebGPU rendering plan — one standalone component
 
 A proposal for **one standalone component**: a WebGPU (Dawn) rendering
-backend for **Blitz**, with a **Dart** frontend. The component renders an
-HTML/CSS UI into either (1) a swapchain — direct presentation to a window
-surface — or (2) a view/texture render target that a host renderer can
-composite — composited into something like thermion (or any other
-renderer).
+backend for **Blitz**, with a **Dart** frontend. The preferred pathway
+renders Blitz's HTML/CSS **natively on the GPU through Dawn**: Blitz's
+**Skia renderer** running on **Skia Graphite** compiled with **Dawn**.
+The component draws into either (1) a swapchain — direct presentation to
+a window surface — or (2) a view/texture render target that a host
+renderer can composite — composited into something like thermion (or any
+other renderer).
+
+A CPU-rendered path (Blitz → RGBA8 bytes) stays in the plan as the first
+milestone and the fallback, not the destination.
 
 Companion to `RENDERING.md` (backend survey) and `UI_BRAINSTORMING.md`
 (threading model). Those documents survey and ask; this one specifies one
@@ -15,30 +20,41 @@ This is a proposal only. No code has been changed.
 
 ## TL;DR
 
-- The component has three parts: **Blitz headless inside a Rust cdylib**
-  (HTML/CSS → CPU RGBA8 buffer), a **Dart frontend** that owns the app and
-  drives it over FFI, and **our own small Dawn compositor** that draws
-  Blitz's output into a target.
-- **Two target modes** (§1.2). **Swapchain mode**: Dawn presents the UI
-  directly to a window surface — an SDL3 window via its native handle, or
-  a window the component owns. **Render-target mode**: Dawn renders into
-  an offscreen view/texture, and a host renderer composites it — into
-  something like thermion (or any other renderer).
-- **The Dawn reality (verified, §6.2):** Blitz's GPU renderer is Vello on
-  wgpu; there is no Vello/Dawn path, and wgpu has no Dawn backend. So
-  "Dawn backend" means **our Dawn-side compositor over Blitz's CPU
-  output**. That keeps Dawn the only GPU implementation in the process.
-- **Render-target mode is the recommended first target** (§6.3 option A):
-  it works with any host, needs no surface plumbing, and its interop story
-  is plain — same-device sharing if the host exposes a Dawn device,
-  otherwise one CPU readback → host upload.
-- **Milestones B1–B5** (§6.6): cdylib + Dart FFI spike → render-target
-  mode with a trivial host composite → swapchain mode on the SDL3 window
-  → perf/dirty-region → hardening. Each produces a runnable thing. No
-  external project is a prerequisite.
-- Known costs: Blitz is beta (0.3.0-beta.1); CSS + layout + paint run on
-  the calling thread; render-target mode pays one CPU copy per frame; a
-  Rust cdylib plus Dawn is a real build surface (§6.7).
+- **The preferred pathway (§1.2):** HTML/CSS (Blitz) → Blitz's **Skia
+  renderer** (`anyrender_skia`) → **skia-safe, forked** (+ a Dawn backend
+  module) → **Skia Graphite** → **Dawn** (WebGPU) → a swapchain or an
+  offscreen texture. HTML/CSS drawn on the GPU through one WebGPU
+  implementation. Chrome ships this same Skia-Graphite-on-Dawn
+  architecture **[verified, §6.2]**.
+- **The fork is the price.** rust-skia exposes Graphite for Metal and
+  Vulkan but has no Dawn support anywhere — no feature, no build flag, no
+  bindings **[verified, §6.2]**. We fork it, add a `dawn` module next to
+  `graphite/mtl.rs`, and turn on Skia's `skia_use_dawn` build flag. Skia
+  + Dawn is a large build (~100 MB class) and the fork needs maintenance
+  **[verified §4; inferred §6.7]**.
+- **The stepping stone (M1, kept as fallback):** the same cdylib running
+  Blitz's **CPU renderer** into an RGBA8 buffer. Fastest first runnable
+  thing; it validates the cdylib and the Dart FFI with no Skia build at
+  all.
+- **Two target modes** (§1.2). **Swapchain mode**: the UI is presented
+  directly to a window surface — an SDL3 window via its native handle.
+  **Render-target mode**: the UI renders into an offscreen texture and a
+  host composites it — something like thermion (or any other renderer).
+- **The device story (§2.3):** the cdylib creates and owns a Dawn
+  instance + device. In render-target mode it can instead take a
+  **host-provided Dawn device** and render on the same device (zero
+  copies); without one it renders on its own device and pays one
+  readback. Sharing works only because both sides run Dawn — one
+  implementation, one device handed over (§4).
+- **Milestones M1–M7** (§6.6): cdylib + FFI spike (CPU) → Skia built with
+  Graphite+Dawn → rust-skia fork + dawn module → Blitz's Skia renderer
+  rendering through Graphite-Dawn → swapchain mode → render-target mode
+  → perf + hardening. Each produces a runnable thing. No external
+  project is a prerequisite.
+- Known costs: the Skia+Dawn build and the fork (§6.7); Blitz is beta
+  (0.3.0-beta.1); Blitz's Skia renderer is the less-travelled path — its
+  image renderer is CPU today, and nobody runs it on Graphite-Dawn yet
+  **[verified, §6.2]**.
 
 ## 1. The component
 
@@ -47,83 +63,91 @@ or host renderer. Three parts, two target modes.
 
 ### 1.1 The three parts
 
-1. **Blitz headless, inside a Rust cdylib.** Blitz renders HTML/CSS on
-   the CPU with no window: `HtmlDocument::from_html` → `resolve(t)` →
-   `paint_scene` → `render_to_buffer` → an RGBA8 buffer **[verified,
-   §6.1]**. The cdylib wraps this and exposes a small C ABI (§2.1).
+1. **Blitz, inside a Rust cdylib.** Blitz turns HTML/CSS into a scene:
+   `HtmlDocument::from_html` → `resolve(t)` → `paint_scene` **[verified,
+   §6.1]**. In the preferred pathway that scene is painted by Blitz's
+   **Skia renderer** (`anyrender_skia`), which draws through a plain
+   Skia `Canvas` **[verified, §6.2]**. In the stepping stone the same
+   scene is painted by the CPU renderer into an RGBA8 buffer. The cdylib
+   wraps either and exposes one small C ABI (§2.1).
 2. **A Dart frontend.** Dart owns the app: it creates the engine, loads
    HTML/CSS, dispatches input, requests frames, and receives the output.
-   The bindings are plain FFI over ~six functions (§2.2).
-3. **Our Dawn compositor.** A small renderer written against Dawn's
-   `webgpu.h` C API. One job: draw Blitz's RGBA8 buffer as a textured
-   quad with alpha blending (plus clip/scissor) into the chosen target —
-   a window surface, or an offscreen view/texture. A quad, a blend state,
-   and a scissor; no more **[inferred: our code to write; the primitives
-   are standard WebGPU]**.
+   Plain FFI over ~eight functions (§2.2). Unchanged by the pathway
+   choice.
+3. **The Dawn layer.** A Dawn instance and device, plus the forked
+   skia-safe. Skia Graphite does the actual drawing — in the preferred
+   pathway we write no UI renderer of our own. A tiny quad compositor of
+   ours exists only in the CPU fallback, where there are plain pixels to
+   blit **[inferred]**.
 
-### 1.2 The two target modes
+### 1.2 The pathway and the two target modes
 
 ```
-                    ┌────────────────────────────────────────────────┐
-                    │   the component (one cdylib + Dart bindings)   │
-                    │                                                │
- window events ───► │  Dart frontend (owns the app)                  │
- (same thread)      │    │ FFI: create / load_html / dispatch /
-                    │    │        render / get_output
-                    │    ▼
-                    │  Blitz headless (HTML/CSS → DOM → layout)
-                    │    │ resolve(t) → paint_scene
-                    │    ▼
-                    │  RGBA8 buffer (CPU; no wgpu anywhere)
-                    │    │
-                    │    ▼
-                    │  Dawn compositor (our code, webgpu.h):
-                    │  textured quad, alpha blend, clip/scissor
-                    └──────────────┬──────────────────┬──────────────┘
-                                   │                  │
-                 MODE a: SWAPCHAIN │                  │ MODE b: RENDER TARGET
-                                   ▼                  ▼
-                   Dawn presents to the window    Dawn renders into an
-                   surface (SDL3 window native   offscreen view/texture
-                   handle, or our own window)        │
-                                   │                 ▼
-                                   │          a host renderer samples /
-                                   ▼          composites it (something
-                     one present; Dawn is     like thermion, or any
-                     the only GPU stack       other renderer); or Dart
-                     in the process           reads pixels back
+              ┌─────────────────────────────────────────────────────┐
+              │     the component (one cdylib + Dart bindings)      │
+              │                                                     │
+ window events│  Dart frontend (owns the app)                       │
+ (same thread)│    │ FFI: create / load_html / dispatch / render    │
+              │    ▼                                                 │
+              │  Blitz (HTML/CSS → DOM → layout → paint scene)      │
+              │    │                                                │
+              │    ▼                                                │
+              │  anyrender skia renderer — paints a plain Skia      │
+              │  Canvas   (stepping stone: CPU renderer → RGBA8     │
+              │  bytes instead, same cdylib, same ABI)              │
+              │    │                                                │
+              │    ▼                                                │
+              │  skia-safe, forked (+dawn module)                   │
+              │    │                                                │
+              │    ▼                                                │
+              │  Skia Graphite (GPU backend) → Dawn (WebGPU)        │
+              │  Dawn instance + device: ours, or a host's          │
+              └─────────────┬──────────────────┬────────────────────┘
+                            │                  │
+          MODE a: SWAPCHAIN │                  │ MODE b: RENDER TARGET
+                            ▼                  ▼
+              present to the window      offscreen texture → a host
+              surface (SDL3 window's    renderer composites it —
+              native handle); the UI    something like thermion, or
+              is the window content    any renderer; or one readback
+                                        → host upload
 ```
 
-- **Mode a — swapchain.** The compositor creates a Dawn surface from the
-  window's native handle — an SDL3 window, or a window the component owns
-  — and presents. The UI *is* the window content. Options B and C in
-  §6.3.
-- **Mode b — render target.** The compositor renders into an offscreen
-  view/texture. A host renderer composites that texture into its own
-  frame — composited into something like thermion (or any other
-  renderer). Interop reality in brief: if the host exposes its Dawn
-  device, the compositor renders on the **same device** and hands over a
-  texture (no copies); if not, the compositor renders on its own device
-  and the pixels cross once through the CPU (readback → host upload)
-  **[inferred: both are standard patterns; neither is built yet]**. And
-  in the minimal version the host can simply take the RGBA8 bytes and
-  upload them itself — no Dawn compositor needed at all (option A,
-  §6.3). Recommended first target.
+- **Mode a — swapchain.** The cdylib creates a Dawn surface from the
+  window's native handle — an SDL3 window, or a window the component
+  owns — Skia renders into the swapchain texture, Dawn presents. The UI
+  *is* the window content. Options B and C in §6.3.
+- **Mode b — render target.** Skia renders into an offscreen texture. A
+  host renderer composites that texture into its own frame — composited
+  into something like thermion (or any other renderer). Interop reality
+  in brief: if the host exposes its Dawn device, the cdylib renders on
+  the **same device** and hands over a texture (no copies); if not, it
+  renders on its own device and the pixels cross once through the CPU
+  (readback → host upload) **[inferred: both are standard patterns;
+  neither is built yet]**. The minimal fallback needs no GPU at all: the
+  CPU renderer's bytes, uploaded by the host itself (option A1, §6.3).
 
 ### 1.3 The Dawn reality, stated plainly
 
-- Blitz's GPU renderer is **Vello on wgpu**. There is no Vello/Dawn path,
-  and wgpu has no Dawn backend **[verified, §6.2]**.
-- So a "Dawn backend" for Blitz cannot mean putting Blitz itself onto
-  Dawn. It means: **Blitz renders on the CPU; our Dawn compositor draws
-  the result.** Blitz's CPU renderer is proven headless **[verified,
-  §6.1]**.
+- Blitz's default GPU renderer is **Vello on wgpu**. There is no
+  Vello/Dawn path, and wgpu has no Dawn backend **[verified, §6.2]**.
+  So "Blitz on Dawn" can never mean Vello.
+- But Blitz also ships a **Skia renderer**, and Skia reaches Dawn.
+  Skia's **Graphite** GPU backend runs on Dawn — Chrome's production
+  architecture — and Skia's build gates it behind `skia_use_dawn`
+  **[verified, §6.2]**. `anyrender_skia` paints through a plain Skia
+  `Canvas` **[verified]**, so a Graphite-Dawn-backed surface can replace
+  today's CPU surface without touching the painting code.
+- **rust-skia has no Dawn support** — not in its features, its build
+  script, or its source **[verified, §6.2]**. Graphite is exposed for
+  Metal (`graphite/mtl.rs`) and Vulkan (`graphite/vk.rs`). So the
+  pathway needs a **fork**: one new `dawn` module parallel to `mtl.rs`,
+  plus build support for `skia_use_dawn`.
 - This keeps **Dawn the only GPU implementation in the process** — no
-  wgpu, no second WebGPU stack. §4 explains why two WebGPU
-  implementations in one process cannot share devices.
-- If GPU-quality Blitz rendering is ever needed, that is Blitz's wgpu
-  renderer (Vello) — a different trade, second GPU stack and all (§6.2,
-  §6.7).
+  wgpu, no second WebGPU stack (§4 explains why two cannot share a
+  device).
+- The CPU bridge (M1) stays as the fallback: proven headless, no build
+  risk, one CPU copy per frame **[verified, §6.1]**.
 
 Related work, context only: Dawn desktop build scaffolding (macOS/Linux
 CI, static-library linking rules) has already been worked out in another
@@ -136,23 +160,40 @@ it.
 ### 2.1 The Rust cdylib — Blitz engine + C ABI
 
 Blitz has no C API **[verified, §6.1]**, so the cdylib is the boundary.
-Sketch of the whole ABI (~300–600 lines of Rust **[inferred]**):
+Sketch of the whole ABI (~400–800 lines of Rust **[inferred]**):
 
 ```c
 typedef struct fz_blitz_t fz_blitz_t;
 
-fz_blitz_t*    fz_blitz_create(int width, int height, float hidpi_scale);
+enum { FZ_BACKEND_CPU = 0, FZ_BACKEND_SKIA_DAWN = 1 };
+
+fz_blitz_t*    fz_blitz_create(int width, int height, float hidpi_scale,
+                               int backend);
 void           fz_blitz_load_html(fz_blitz_t*, const char* html,
                                   const char* base_url);
 void           fz_blitz_set_viewport(fz_blitz_t*, int width, int height,
                                      float hidpi_scale);
 void           fz_blitz_dispatch(fz_blitz_t*, const fz_blitz_event_t* events,
                                  int count);
+
+/* CPU backend: render, return borrowed RGBA8 bytes. */
 const uint8_t* fz_blitz_render(fz_blitz_t*, double time_ms,
-                               int* out_w, int* out_h);   /* borrowed */
+                               int* out_w, int* out_h);
+
+/* Skia-Dawn backend: render on the GPU, then present or export. */
+void           fz_blitz_attach_surface(fz_blitz_t*,
+                                       void* raw_window_handle,
+                                       void* raw_display_handle);
+void           fz_blitz_set_host_device(fz_blitz_t*, void* wgpu_device);
+void           fz_blitz_render_frame(fz_blitz_t*, double time_ms);
+const uint8_t* fz_blitz_readback(fz_blitz_t*, int* out_w, int* out_h);
+
 void           fz_blitz_destroy(fz_blitz_t*);
 ```
 
+- **Backend choice at create.** CPU first (M1); Skia-Dawn once the fork
+  lands (M4+). The rest of the ABI is the same either way — that is the
+  point of the seam.
 - **Threading is trivial.** Everything is called from one thread — the
   Dart platform thread — like every other FFI call the app makes. No
   winit, no event loop inside the cdylib: input arrives as data
@@ -161,43 +202,54 @@ void           fz_blitz_destroy(fz_blitz_t*);
 - **Frame gating.** Re-render only when something changed — an event
   arrived, or an animation is running. Blitz's own shell does exactly
   this (`is_animating()` gate) **[verified, §6.1]**.
-- **Sizing.** `fz_blitz_set_viewport` on window resize; the buffer size
-  follows the window.
+- **Sizing.** `fz_blitz_set_viewport` on window resize; the surface or
+  buffer follows the window.
 
 ### 2.2 The Dart frontend
 
-- Six functions: hand-written FFI lookups are fine; `ffigen` optional.
-  Days of work **[inferred]**.
+- Eight to ten functions: hand-written FFI lookups are fine; `ffigen`
+  optional. Days of work **[inferred]**.
 - Dart owns the app and the frame loop: poll window events →
-  `fz_blitz_dispatch` → `fz_blitz_render` → hand the bytes or texture to
-  the target (mode a: compositor; mode b: host).
+  `fz_blitz_dispatch` → the render call → present, export, or hand off
+  bytes, depending on backend and mode.
 - **Input routing.** Window events become `fz_blitz_event_t` values.
   Hit-testing and hover are Blitz's job — DOM-aware, it knows which
   element is under the cursor **[verified, §6.4]**. The routing policy —
   the UI owns the pointer over interactive elements, events fall through
   to the host scene elsewhere — is Dart's choice **[inferred]**.
 
-### 2.3 The Dawn compositor
+### 2.3 The Dawn layer (and where our own compositor went)
 
-- Written against Dawn's `webgpu.h` C API — Dawn is the reference
-  implementation of that standard header **[verified, §4]**. One
-  pipeline: a textured quad with per-fragment
-  alpha, a clip/scissor rect, a WGSL shader of tens of lines
-  **[inferred]**. It can live in the same cdylib (Rust calling Dawn's C
-  API) or in a small C++ library beside it — a build-time choice, not an
-  architectural one **[inferred]**.
-- **Mode a plumbing:** create the surface from the window's native handle
-  — on macOS the handle SDL3 exposes (`SDL_Metal_GetLayer`), on Linux the
-  X11 window + display, on Windows the HWND **[verified SDL3 exposes
-  these handles; whether Dawn consumes the layer or wants the NSView
-  needs a one-day spike — inferred]**. Present in `Fifo` mode so frames
-  pace to vsync **[inferred]**.
+- **Device story.** The cdylib creates and owns a Dawn instance and
+  device — the default in swapchain mode. In render-target mode it can
+  instead take a **host-provided Dawn device**
+  (`fz_blitz_set_host_device`): Skia Graphite accepts a client-created
+  Dawn instance/device/queue (`DawnBackendContext`, §6.2), so the UI
+  renders on the host's device into a texture the host samples — zero
+  copies **[verified the Skia entry point exists]**. Without a host
+  device, the cdylib uses its own and pays one readback per frame.
+  Honest interop note: this sharing works because both sides run **the
+  same implementation (Dawn) and share one device object**; two
+  separately created devices — even both Dawn — still cannot share
+  textures **[inferred from §4]**.
+- **Where the drawing happens.** Skia Graphite renders the scene. A quad
+  compositor of our own — a textured quad, a blend state, a WGSL shader
+  of tens of lines — survives **only in the CPU fallback**, where the
+  cdylib's bytes must be drawn to a GPU target **[inferred]**. In the
+  preferred pathway we write no shader at all.
+- **Mode a plumbing:** create the Dawn surface from the window's native
+  handle — on macOS the handle SDL3 exposes (`SDL_Metal_GetLayer`), on
+  Linux the X11 window + display, on Windows the HWND **[verified SDL3
+  exposes these handles; whether Dawn consumes the layer or wants the
+  NSView needs a one-day spike — inferred]**. Present in `Fifo` mode so
+  frames pace to vsync **[inferred]**.
 - **Mode b plumbing:** an offscreen `RGBA8_UNORM` texture with
   `RENDER_ATTACHMENT` (and `COPY_SRC` when a readback path is wanted).
 - **Resize:** recreate surface or texture, call `fz_blitz_set_viewport`.
-- **Build cost:** linking Dawn brings its static libraries and their
-  C++ toolchain quirks; expect the linked output to grow by tens of MB.
-  Measure in milestone B3 **[inferred]**.
+- **Build cost:** Skia with Graphite+Dawn is the ~100 MB-class build of
+  §4, on top of Dawn's own static libraries. rust-skia's prebuilt
+  binary cache will have nothing for a forked feature set, so expect
+  source builds in CI **[inferred]**. Measure in M2.
 
 ### 2.4 What the component does not do
 
@@ -214,16 +266,19 @@ Why this shape and not another? All priced from verified facts in
 
 | Strategy | GPU stacks in process | UI quality | Build cost | Verdict |
 |---|---|---|---|---|
-| **Blitz CPU + our Dawn compositor** (this plan) | 1 (Dawn) | browser-grade CSS: stylo + taffy + parley **[verified §6.1]** | Rust cdylib + small Dawn renderer | **chosen** — one GPU stack, any host, headless path proven |
-| Blitz GPU renderer (Vello on wgpu) | 2 (wgpu + host's), or 1 with no host | same CSS, GPU-quality AA | cdylib + wgpu | second WebGPU stack, still a CPU copy to reach a host **[verified §6.2]** |
-| Skia Graphite on Dawn | 1 (Dawn) | full (HarfBuzz/ICU bundled) **[verified §4]** | ~100 MB build, 500–1500-line C wrapper **[verified §4]** | escape hatch only — "Flutter rendering, externalized" |
-| Dear ImGui on Dawn | 1 (Dawn) | rasterized glyphs, no shaping **[verified §5]** | small: cimgui + ~50-line shim **[verified §5]** | the cheap Dawn alternative; immediate mode, no HTML/CSS |
+| **Blitz Skia renderer on Graphite-Dawn** (forked skia-safe) — this plan | 1 (Dawn) | browser-grade CSS: stylo + taffy + parley **[verified §6.1]**, drawn by Skia's GPU raster | Skia+Dawn build (~100 MB class **[verified §4]**) + a rust-skia fork (one module + build flags) | **preferred** — HTML/CSS natively on the GPU, one WebGPU stack |
+| Blitz CPU renderer + our Dawn quad compositor | 1 (Dawn) | same CSS; CPU raster **[verified §6.1]** | Rust cdylib + a small quad renderer; no Skia build | **stepping stone (M1) and fallback** — fastest first runnable, one CPU copy per frame |
+| Blitz GPU renderer (Vello on wgpu) | 2 (wgpu + host's), or 1 with no host | same CSS, GPU-quality AA | cdylib + wgpu | wgpu-split option — second WebGPU stack, still a copy to reach a host **[verified §6.2]** |
+| Dear ImGui on Dawn | 1 (Dawn) | rasterized glyphs, no shaping **[verified §5]** | small: cimgui + ~50-line shim **[verified §5]** | immediate-mode alternative; no HTML/CSS |
 | Hand-rolled WGSL UI renderer | 1 | ours to build (no CSS, no shaper) | 4–6 weeks | rebuilds what Blitz gives for free |
 
 The choice follows the requirements: HTML/CSS authoring, retained mode,
-Dawn as the only GPU implementation, Dart owns the app, small-ish and
-permissively licensed (Blitz is Apache-2.0 OR MIT **[verified, §6.1]**).
-Only the first row satisfies all five.
+Dawn as the only GPU implementation, Dart owns the app, permissively
+licensed (Blitz is Apache-2.0 OR MIT **[verified, §6.1]**). The preferred
+row satisfies all five and pays in build size and fork maintenance. The
+stepping-stone row satisfies them too — minus GPU-quality rendering —
+and pays almost nothing to start. That is why M1 runs on it before the
+fork exists.
 
 ## 4. UI framework WebGPU backend research
 
@@ -237,8 +292,8 @@ are **[verified]** (read from the project's own repo/docs this round) or
 ### The key constraint first: two WebGPU implementations exist
 
 - **Dawn** — Google's C++ WebGPU implementation: Chrome's, Skia
-  Graphite's target, and the API our compositor (§1) is written against
-  **[verified: §4 Skia entry; RENDERING.md]**.
+  Graphite's target, and the WebGPU implementation the component renders
+  through (§1) **[verified: §4 Skia entry; RENDERING.md]**.
 - **wgpu** — the Rust implementation. On desktop, Rust UI projects use
   the `wgpu` crate, which compiles to its own GPU layer over
   Vulkan/Metal/D3D12. `wgpu-native` packages it as a C library exposing
@@ -261,8 +316,9 @@ a Dawn-based host" always means one of:
    title "Feature Request: Adding Slint into a custom renderer",
    discussing dmabuf conversion as future work]**.
 3. **One stack only** — everything on Dawn, or everything on wgpu. That
-   is what the component does (Blitz CPU + our Dawn compositor, §1.3).
-   It is impossible when the UI stack insists on wgpu and the host on
+   is what the component does: Blitz's Skia renderer on Graphite-Dawn,
+   with the CPU bridge as the no-GPU fallback (§1.3). It is impossible
+   when the UI stack insists on wgpu and the host on
    Dawn — no implementation hands its devices to another **[inferred]**.
 
 One useful fact for later: both implementations speak the same standard
@@ -384,7 +440,7 @@ Every candidate from `RENDERING.md` was checked.
 
 **Skia Graphite** (google/skia)
 - Graphite's cross-platform GPU path is Dawn — the *same* implementation
-  our compositor targets (§1). Dawn covers D3D12 (Windows), Vulkan
+  the component renders through (§1). Dawn covers D3D12 (Windows), Vulkan
   (Linux), Metal (macOS); Graphite first shipped in Chrome on
   Apple-Silicon/Metal **[verified: Skia announce blog + SkiaSharp
   Graphite tracking issue; RENDERING.md §ladder]**.
@@ -400,6 +456,11 @@ Every candidate from `RENDERING.md` was checked.
   must hand its device to the other **[inferred]**. And the cost is the
   known one: ~100 MB build,
   "Flutter rendering, externalized" **[verified: RENDERING.md]**.
+- Update (2026-08-16): this is no longer just the escape hatch. The
+  component's preferred pathway now renders Blitz's HTML/CSS through
+  Skia Graphite on Dawn — but via Blitz's Skia renderer and a forked
+  rust-skia, not a hand-written C wrapper over Skia's canvas API (§1.3,
+  §6.2).
 
 ### Comparison table
 
@@ -461,8 +522,11 @@ turns out to hurt.
 that could ever take a Dawn device directly (ours, §1). It also solves
 text completely. It loses
 on size (~100 MB) and on the "we just rebuilt Flutter" problem
-`RENDERING.md` names. Keep it as the escape hatch if quality demands
-it, not the plan **[inferred from RENDERING.md's analysis]**.
+`RENDERING.md` names. This section wrote it off as the escape hatch; the
+component later adopted it as the preferred pathway — through Blitz's
+Skia renderer on a forked rust-skia, which keeps HTML/CSS authoring and
+avoids the hand-written canvas wrapper (§1.3, §6.2) **[inferred from
+RENDERING.md's analysis + §6.2's verification]**.
 
 **Correction to `RENDERING.md`:** Makepad is listed there as a wgpu
 target; per its own README it is not. The WebGPU-framework shortlist is
@@ -474,7 +538,10 @@ component (§1) later chose Blitz rather than a renderer under a Dart
 canvas; §5 reopened the question with window ownership allowed. Vello +
 Parley remains the named 2D-only GPU renderer on wgpu if that shape is
 ever wanted — buffer-level first, GPU interop deferred until either
-stack grows external-memory support.
+stack grows external-memory support. The preferred pathway then adopted
+this section's Dawn-native pick: Blitz's Skia renderer on Graphite-Dawn
+(§1.3), with Skia entering through Blitz instead of as a standalone
+canvas API.
 
 ## 5. Widget framework on a WebGPU backend
 
@@ -646,8 +713,9 @@ search surfaced only small projects (<350 stars, most started in 2026)
   writing UI in HTML/CSS, and Dioxus (RSX) for logic. Big departure
   from a Dart widget tree **[inferred]**. *(Update 2026-08-16: the
   renderer is now the `anyrender` crate family, not
-  `blitz-renderer-vello`, and it includes a CPU renderer. Blitz became
-  the pick — see §1 and §6 for the component plan.)*
+  `blitz-renderer-vello`, and it includes a CPU renderer and a Skia
+  renderer. Blitz became the pick — first on the CPU renderer, now
+  aimed at its Skia renderer on Graphite-Dawn; see §1 and §6.)*
 
 **Vizia** (vizia/vizia) — **excluded.** The README says rendering
 "leverages the powerful and robust skia library" — it moved off
@@ -675,7 +743,7 @@ Graphite (Dawn, ~100 MB).
 | **Dear ImGui** | immediate | yes | **Dawn, wgpu-native, or WGVK — pick at compile** | core via cimgui; wgpu backend needs ~50-line shim | MIT | v1.92.9b, 2026-07-31 | ~100s KB [inferred] | rasterization only, no shaping |
 | **egui** | immediate | yes | wgpu | no — cdylib | Apache-2.0 | 0.36.1, 2026-08-07 | few MB [inferred] | none |
 | **Floem** | **retained** | yes | wgpu (vger/vello) | no — cdylib | MIT | v0.2.0, 2024-11 (pushed 2026-06) | ~wgpu + renderer [inferred] | yes (own stack, unverified which) |
-| **Blitz (Dioxus)** | retained (HTML/CSS) | yes | wgpu (Vello) | no — cdylib | Apache-2.0/MIT (+1 MPL crate) | none tagged; beta | large (Stylo) [inferred] | yes (browser-grade CSS text) |
+| **Blitz (Dioxus)** | retained (HTML/CSS) | yes | wgpu (Vello) default; the Skia renderer can reach Dawn via a fork (§6.2) | no — cdylib | Apache-2.0/MIT (+1 MPL crate) | none tagged; beta | large (Stylo) [inferred] | yes (browser-grade CSS text) |
 | **GPUI** | retained | **Linux only** | wgpu (macOS=Metal, Windows=DirectX, baked) | no — closure-heavy Rust | Apache-2.0 | 0.2.2, 2025-10 (lags repo) | large [inferred] | yes (cosmic-text) |
 | Slint | retained | yes (unstable feature) | wgpu (via FemtoVG) | C++ (skia/software only) | **GPLv3 / royalty-free / commercial** | v1.17.1, 2026-07-07 | few MB [inferred] | yes |
 | Vizia | retained | **no** (Skia) | — | no | MIT | 0.4.0, 2026-04 | — | — |
@@ -690,7 +758,7 @@ Graphite (Dawn, ~100 MB).
 It is the only candidate that satisfies every hard requirement at once:
 
 - Native WebGPU on desktop, and it can sit on **Dawn — the same WebGPU
-  implementation our compositor targets (§1)** **[verified]**. No other
+  implementation the component renders through (§1)** **[verified]**. No other
   widget framework can (everything Rust is wgpu; Slint is wgpu; GPUI is
   Metal/DirectX outside Linux).
 - It has a C ABI story today: cimgui for the core, a ~50-line shim for
@@ -743,19 +811,22 @@ wgpu. So the coexistence story with a Dawn-based host is:
 | Anything on wgpu | no | RGBA8 buffer handoff (§1.2 mode b) |
 
 The cheapest real unlock for tight coexistence is a presenting side
-that exposes its Dawn `WGPUDevice`/queue through its API — our
-compositor (§2.3) would offer exactly that. Then any Dawn-side UI layer
+that exposes its Dawn `WGPUDevice`/queue through its API — our cdylib's
+Dawn layer (§2.3) would offer exactly that. Then any Dawn-side UI layer
 can encode directly on the same device and swapchain. Speculative until
-swapchain mode lands (§6.6 B3) **[inferred]**.
+swapchain mode lands (§6.6 M5) **[inferred]**.
 
 **6. Impact on the plan.** What this section adds: (a) GPUI is out,
 with evidence; (b) for an adopted framework rather than built widgets,
 the shortlist was **Floem for retained** (accept the wrapper and the
 wgpu split) or **Dear ImGui on Dawn for immediate** (cheapest binding,
 the only Dawn-compatible option, SDL3 backend done) — and the deep-dive
-then chose **Blitz** (§6): HTML/CSS rather than a Rust widget toolkit,
-with a CPU renderer that keeps Dawn the only GPU stack. §4's conclusion
-(Vello for a 2D-only renderer under a Dart canvas) stands as context.
+then chose **Blitz** (§6): HTML/CSS rather than a Rust widget toolkit.
+The CPU renderer kept Dawn the only GPU stack at first; the preferred
+pathway now renders Blitz's Skia output on Graphite-Dawn (§1.3), which
+makes Blitz itself the Dawn-compatible option this section was looking
+for. §4's conclusion (Vello for a 2D-only renderer under a Dart canvas)
+stands as context.
 
 ## 6. Blitz + WebGPU: evidence, options, milestones
 
@@ -765,8 +836,9 @@ process; two different ones cannot share a GPU device (§4). §1–§3
 specify the component; this section is its evidence base and its
 option/milestone detail. Everything below was read from upstream source
 on 2026-08-16 (shallow clone of `DioxusLabs/blitz`, plus the
-`DioxusLabs/anyrender`, `linebender/vello`, `gfx-rs/wgpu`, and
-`rust-windowing/winit` repos). Claims are **[verified]** (read from
+`DioxusLabs/anyrender`, `linebender/vello`, `gfx-rs/wgpu`,
+`rust-windowing/winit`, `rust-skia/rust-skia`, and `google/skia`
+repos). Claims are **[verified]** (read from
 source this round) or **[inferred]**.
 
 ### 6.1 Verified facts about Blitz
@@ -848,45 +920,93 @@ Two more verified details we rely on below:
 ### 6.2 The Dawn verdict
 
 The question: can Blitz render through **Dawn**, the same WebGPU
-implementation our compositor targets (§1)? The chain, verified link
-by link:
+implementation the component targets (§1)? Two answers, because Blitz
+has two GPU-capable renderers.
 
-1. Blitz's GPU renderer is `anyrender_vello` → **vello** **[verified]**.
+**Vello: no — verified, link by link.**
+
+1. Blitz's default GPU renderer is `anyrender_vello` → **vello**
+   **[verified]**.
 2. Vello uses **wgpu** for all GPU access. Its workspace pins
    `wgpu = 29.0.3` **[verified]**. There is no other GPU backend: the old
-   custom HAL (`piet-gpu-hal`) was dropped in favor of wgpu, and the README
-   states "using [`wgpu`] for GPU access" **[verified]**. `vello_cpu` is
-   the CPU variant — not a Dawn path **[verified]**.
+   custom HAL (`piet-gpu-hal`) was dropped in favor of wgpu, and the
+   README states "using [`wgpu`] for GPU access" **[verified]**.
+   `vello_cpu` is the CPU variant — not a Dawn path **[verified]**.
 3. A search of vello's issues for "Dawn" returns **zero** results
    **[verified]**. No backend trait exists to swap in.
 4. **wgpu itself has no Dawn backend.** Its `Cargo.toml` backend features
    are `dx12`, `metal`, `vulkan`, `gles`, `webgpu` (WASM-only), and
    `webgl` (WASM-only) **[verified]**. Nothing targets native Dawn.
 
-**Verdict: "Blitz on Dawn" is not achievable today.** Not with a flag, not
-with a small patch. Blitz's whole GPU path is compiled against wgpu's Rust
-API (`Device`/`Queue`/`Texture` types), not against the standard
-`webgpu.h` C API that Dawn and wgpu-native share. Porting vello to Dawn
-would mean reimplementing vello's renderer.
+Vello is compiled against wgpu's Rust API (`Device`/`Queue`/`Texture`
+types), not the standard `webgpu.h` C API that Dawn and wgpu-native
+share. Porting vello to Dawn would mean reimplementing vello's renderer.
 
-What *is* achievable, stated plainly:
+**Skia: yes — through a fork. This is the preferred pathway (§1).**
 
-- **Blitz on wgpu** — the only native GPU path Blitz has.
-- **Blitz on CPU** (`anyrender_vello_cpu`) — no GPU stack at all inside
-  Blitz. The screenshot example uses exactly this **[verified]**. This is
-  the interesting one for us: on the buffer-handoff path (option A below)
-  the CPU renderer means **no second WebGPU stack in the process**.
-  Dawn stays the only GPU stack **[inferred — the CPU renderer
-  exists and is proven; its speed at our frame sizes is unmeasured]**.
-- **A different UI stack on Dawn**: Dear ImGui's `imgui_impl_wgpu`
-  compiled with `IMGUI_IMPL_WEBGPU_BACKEND_DAWN` (§5), or Skia Graphite
-  (§4). If sharing a host's Dawn device ever becomes the hard
-  requirement, Blitz is the wrong tool and ImGui is the cheap answer.
+- Blitz's renderer list includes `anyrender_skia` 0.10 **[verified,
+  §6.1]**. It uses the **stock `skia-safe` crate** — 0.97.0 (0.97.2 with
+  `metal` on Apple), plus an optional `vulkan` feature. Not a fork
+  **[verified]**.
+- Its image renderer is **CPU raster today**: it wraps the caller's
+  buffer with `surfaces::wrap_pixels(...)`, clears to transparent, and
+  paints **[verified]**. But the painting goes through
+  `SkiaScenePainter`, which draws with a plain `skia_safe::Canvas` —
+  Paint, Path, Shader, ImageFilter, Font; no surface or GPU-context
+  types of its own **[verified]**. Any Skia surface can back it,
+  including a Graphite-Dawn one. The painting code is the compatible
+  seam.
+- Skia's **Graphite** backend has a first-class **Dawn** path: the
+  public header `include/gpu/graphite/dawn/DawnBackendContext.h` holds a
+  `wgpu::Instance`, `wgpu::Device`, and `wgpu::Queue` that the **client**
+  creates, and `ContextFactory::MakeDawn(...)` builds the Graphite
+  context from them; a full `src/gpu/graphite/dawn/` implementation sits
+  under it **[verified]**. Skia's GN args make the relationship explicit:
+  `skia_use_dawn` defaults to false, and
+  `assert(!skia_use_dawn || skia_enable_graphite)` — Dawn is
+  Graphite-only **[verified]**. Chrome ships Graphite on Dawn (§4)
+  **[verified]**.
+- **rust-skia has no Dawn support.** A search of the whole repo for
+  "dawn" returns zero hits — no feature, no build flag, no bindings
+  **[verified]**. What it does have, behind the `graphite` feature
+  (part of `all-macos`/`all-linux`/`all-windows`, not the default):
+  `skia-safe/src/graphite/` with `Context`/`Recorder`/`Recording`,
+  Graphite surfaces and images, and two backend modules — `mtl.rs`
+  (Metal, cfg `metal`) and `vk.rs` (Vulkan, cfg `vulkan`) — each with a
+  `make_context` built from raw handles; plus examples
+  (`graphite_offscreen.rs`, `graphite_offscreen_vulkan.rs`,
+  `graphite_readback.rs`) **[verified]**. The build passes
+  `skia_enable_graphite` when the feature is on **[verified]**.
+- **The fork, then:** (1) build support — turn on `skia_use_dawn` in
+  `skia-bindings`' build, next to the existing `skia_enable_graphite`
+  arg, and fetch Dawn's source through Skia's dependency checkout;
+  (2) bindings — wrap `DawnBackendContext`, `MakeDawn`, and a
+  `BackendTexture` made from a Dawn `WGPUTexture`; (3)
+  `skia-safe/src/graphite/dawn.rs`, parallel to `mtl.rs`, plus a `dawn`
+  feature **[inferred: the work plan; each piece has a verified
+  precedent in the same repo]**.
 
-So the real choice for Blitz is: **CPU renderer + buffer handoff (one GPU
-stack: Dawn)**, or **wgpu renderer (GPU quality, second WebGPU
-stack, still a CPU copy to reach any host)**. Device sharing is impossible
-in both — §4's conclusion stands.
+**Verdict, restated: "Blitz on Dawn" is achievable — through the Skia
+renderer.** Not through Vello (wgpu-locked), but through `anyrender_skia`
+on forked skia-safe with Graphite-Dawn. The costs: the Skia+Dawn build
+(~100 MB class, §4), the fork's maintenance, and being first — nobody
+runs `anyrender_skia` on Graphite-Dawn today, and its own image renderer
+is CPU-only until we change it **[verified]**.
+
+What is achievable, stated plainly:
+
+- **Blitz's Skia renderer on Graphite-Dawn** — the preferred pathway.
+  One GPU stack (Dawn); HTML/CSS drawn by Skia; same-device sharing with
+  a Dawn-based host is possible because the Graphite context is made
+  from a client-provided Dawn device.
+- **Blitz on CPU** (`anyrender_vello_cpu`) — no GPU stack inside Blitz;
+  proven headless (the screenshot example); our stepping stone and
+  fallback **[verified]**.
+- **Blitz on wgpu** (Vello) — GPU quality, but a second WebGPU stack
+  that cannot share with Dawn, and still a CPU copy to reach a host.
+
+Device sharing exists only on the first bullet, and only when one side
+hands its Dawn device to the other (§4).
 
 ### 6.3 Integration options
 
@@ -894,28 +1014,28 @@ The two modes of §1.2 become three options once "who owns the window" is
 decided.
 
 #### Option A — render-target mode: composite into a host
-*(recommended first — renders into an offscreen texture, works with any
-host; the composite anatomy is §6.4)*
+*(renders into an offscreen texture, works with any host; the composite
+anatomy is §6.4)*
 
 ```
 Dart (platform thread, every frame)
   ├─ window events → fz_blitz_dispatch(events[])          [cdylib]
-  ├─ tick → fz_blitz_render(time_ms) → RGBA8 bytes         [cdylib:
-  │        resolve(t) → paint_scene → render_to_buffer — CPU, no wgpu]
-  └─ hand the UI to the host, weakest first:
-       A1: host uploads the bytes as its own texture and composites
-           them in an overlay pass   (no Dawn compositor needed at all)
-       A2: our Dawn compositor renders the quad into an offscreen
-           texture; the host samples that texture
-           • host exposes a Dawn device → same device, shared texture,
-             zero copies
-           • no exposed device → our own device, one readback → host
-             upload (same cost as A1 plus a GPU draw)
+  └─ tick → fz_blitz_render_frame(time_ms)          [cdylib: resolve(t)
+         → paint_scene → Skia draws the scene on the GPU via Dawn]
+       then hand the UI to the host, strongest first:
+       GPU + host device: host exposes a Dawn device → Skia renders on
+           that same device into a texture → host samples it
+           (zero copies)
+       GPU, no host device: our own Dawn device → offscreen texture →
+           one readback → host upload
+       A1 (CPU stepping stone / fallback): fz_blitz_render → RGBA8
+           bytes → the host uploads them itself (no Dawn inside the
+           component at all)
 ```
 
-- **What we build:** the §2.1 cdylib + §2.2 bindings, always. Then A1
-  costs nothing more — the host already knows how to sample a texture.
-  A2 adds the §2.3 compositor in offscreen form.
+- **What we build:** the §2.1 cdylib + §2.2 bindings, always. The GPU
+  lanes need the fork (M4); A1 needs nothing more — the host already
+  knows how to sample a texture.
 - **Input:** §2.2. Hit-testing is Blitz's; the routing policy is Dart's.
 - **Vsync / frame scheduling:** the host owns presentation entirely. The
   component is a pixel producer; the host's frame loop calls the shots.
@@ -923,25 +1043,28 @@ Dart (platform thread, every frame)
   `DisplayList` is a flat list of draw commands; HTML/CSS brings its own
   layout, styling, and retained DOM. Blitz sits **beside** the seam
   (§7). Dart-drawn UI can still use it in the same frame.
-- **Interop reality:** no GPU interop needed. A1 is one CPU copy per
-  frame. A2 is zero copies only if the host hands over its Dawn device;
-  otherwise it is A1 plus a GPU draw **[inferred; both standard]**.
-- **Costs:** the copy (800×600 RGBA8 ≈ 1.9 MB/frame; 4K ≈ 33 MB — fine
-  at the first size, measure at the second), and layout + style + paint
-  running on the platform thread. Stylo is a real CSS engine; per-frame
-  cost for a realistic HUD is unknown **[inferred; measure in B2]**.
+- **Interop reality:** the zero-copy lane needs the host to hand over
+  its Dawn device; without one, one readback per frame. A1 needs no GPU
+  interop at all — one CPU copy per frame **[inferred; both standard]**.
+- **Costs:** the readback copy (800×600 RGBA8 ≈ 1.9 MB/frame; 4K ≈
+  33 MB — fine at the first size, measure at the second), and layout +
+  style + paint running on the platform thread. Stylo is a real CSS
+  engine; per-frame cost for a realistic HUD is unknown **[inferred;
+  measure in M6]**.
 
 #### Option B — swapchain mode on the SDL3 window
 
-The compositor draws the UI **directly into the Flutter Zero window**:
-Dawn creates a surface from the window's raw handle and presents.
+The component draws the UI **directly into the Flutter Zero window**:
+Skia renders into a Dawn surface created from the window's raw handle,
+and Dawn presents.
 
 ```
 Dart (platform thread, every frame)
   ├─ window events → fz_blitz_dispatch(events[])
-  ├─ tick → fz_blitz_present(time_ms)              [compositor:
-  │        resolve → paint_scene → Dawn surface from the SDL3 window's
-  │        native handle → draw quad → present (Fifo → vsync-paced)]
+  ├─ tick → fz_blitz_render_frame(time_ms)         [cdylib: resolve →
+  │        paint_scene → Skia renders into the Dawn swapchain texture
+  │        (surface from the SDL3 window's native handle) → present
+  │        (Fifo → vsync-paced)]
   └─ a host renderer CANNOT also present to this window — one
        presentation path per window. Either this window has no host 3D
        content, or the host composites offscreen and feeds the result
@@ -951,11 +1074,12 @@ Dart (platform thread, every frame)
 
 - **What we build:** option A's pieces plus surface creation
   (`fz_blitz_attach_surface(raw_window_handle, raw_display_handle)`),
-  present, and resize (surface reconfigure + `set_viewport`).
+  present, and resize (surface reconfigure + `set_viewport`). The
+  drawing itself is Skia's — no compositor, no shader of ours.
 - **Input:** identical to option A.
-- **Vsync / frame scheduling:** presentation moves to the compositor.
-  `Fifo` present blocks to vsync **[inferred]**; the Dart frame loop
-  paces behind it.
+- **Vsync / frame scheduling:** presentation moves to the cdylib's Dawn
+  layer. `Fifo` present blocks to vsync **[inferred]**; the Dart frame
+  loop paces behind it.
 - **The DisplayList seam:** replaced for this window, as in option A.
 - **Interop reality:** if a host renderer is also in the process, its
   GPU stack and our Dawn device are separate — no shared devices, no
@@ -967,7 +1091,7 @@ Dart (platform thread, every frame)
   the platform thread. The handle itself has a wrinkle: our SDL3 code
   obtains a `CAMetalLayer` (`SDL_Metal_GetLayer`) **[verified]**, and
   whether Dawn's surface creation consumes a layer or wants the NSView
-  is exactly the one-day spike B3 starts with **[inferred]**. On
+  is exactly the one-day spike M5 starts with **[inferred]**. On
   Linux/X11 the raw-handle path (window XID + display connection) is
   standard **[inferred]**.
 
@@ -1029,9 +1153,11 @@ Host renderer (any engine; something like thermion, or any other)
          (transparent UI pixels let the host scene show through)
 
 UI texture contents (the component, option A):
-  HTML/CSS DOM → resolve(t) → paint_scene → render_to_buffer
-    → RGBA8 bytes (CPU, no wgpu) → upload (host's or compositor's
-    texture) → sampled by the overlay quad
+  preferred: HTML/CSS DOM → resolve(t) → paint_scene → Skia Graphite
+    draws the scene on a Dawn device straight into the texture (the
+    host's device, if it exposed one) → the overlay quad samples it
+  fallback: paint_scene → CPU renderer → RGBA8 bytes → upload →
+    sampled by the overlay quad
 ```
 
 - **Alpha.** The overlay needs per-fragment alpha: the quad's material
@@ -1067,119 +1193,157 @@ UI texture contents (the component, option A):
   recreate the texture (GPU textures are fixed-size; an upload cannot
   grow one), update the overlay quad if needed, and call
   `fz_blitz_set_viewport` **[inferred]**.
-- **Perf profile.** One CPU copy per frame in A1 (bytes → host texture).
-  Milestone B2 measures whether the CPU renderer holds 60 Hz. The
-  fallback ladder, cheapest first: (1) re-render only when dirty — a
+- **Perf profile.** The zero-copy lane (host device) pays no per-frame
+  copy; the readback and CPU lanes pay one. M6 measures both lanes, and
+  M7 adds the ladder, cheapest first: (1) re-render only when dirty — a
   static HUD skips nearly every frame; (2) smaller UI texture or
-  partial uploads; (3) Blitz's wgpu GPU renderer — last resort, it
-  breaks the single-GPU-stack property (§6.2) **[inferred ordering]**.
-- **The GPU-drawn alternative, for contrast.** Drawing the UI directly
-  on the GPU into the same swapchain (an ImGui-on-Dawn layer, §5, is
-  the example) requires the presenting side to expose its Dawn device
-  (and queue, and the swapchain's current texture) so the UI pass can
-  encode *after* the host's pass, on the same device. With no exposed
-  device, a second Dawn or wgpu instance cannot touch that swapchain —
-  no device sharing between implementations (§4). The texture-quad
-  route avoids the entire problem: it needs nothing from the host
-  beyond "sample a texture and blend a quad."
+  partial uploads; (3) fall back to the CPU renderer — last resort for
+  a broken build, and it keeps the single-GPU-stack property (§6.2)
+  **[inferred ordering]**.
+- **The GPU-drawn path is the destination.** With Graphite-Dawn the
+  component draws the UI on the GPU itself (§1.2). On a host-owned
+  swapchain this needs the presenting side to expose its Dawn device
+  (and queue, and the swapchain's current texture) so Skia can render
+  into it — the same-device story of §2.3. With no exposed device, a
+  second Dawn or wgpu instance cannot touch that swapchain — no device
+  sharing between implementations (§4). The texture-quad route with one
+  readback avoids the entire problem: it needs nothing from the host
+  beyond "sample a texture and blend a quad." (An ImGui-on-Dawn layer,
+  §5, is the same shape with a different renderer.)
 
 ### 6.5 Comparison
 
 | | A: render target | B: swapchain on our window | C: own window |
 |---|---|---|---|
 | Window | host's (or none) | SDL3 (ours), presented by Dawn | the component's |
-| Who presents | host | our Dawn compositor | the component's window layer |
+| Who presents | host | Dawn (we call present) | the component's window layer |
 | Host 3D under the UI | yes, any host | not on this window (or pay the copy inverted) | separate window |
-| GPU stacks in process | host's + ours only in A2-no-share; A1 = host's only | ours (Dawn) + host's if any | ours (Dawn) |
-| Copies per frame | 1 in A1; 0–1 in A2 | 0 if UI-only; 1–2 with host content | 0 between windows |
+| GPU stacks in process | one (Dawn) if the host shares its device or on A1; host's + ours otherwise | ours (Dawn) + host's if any | ours (Dawn) |
+| Copies per frame | 0 same-device; 1 on readback or CPU | 0 if UI-only; 1–2 with host content | 0 between windows |
 | macOS viable in-process | yes | probably (surface spike first) | **no** (winit main-thread panic) |
-| New code | cdylib + bindings (A1 adds nothing) | + surface attach, present, resize | smallest Rust, biggest architecture |
+| New code | cdylib + bindings + the fork (GPU lanes); A1 adds nothing | + surface attach, present, resize | smallest Rust, biggest architecture |
 | Event loop owner | host / Dart app | Dart app; present blocks | the component's |
 | DisplayList seam | beside it (kept) | replaced for this window | untouched |
 
 ### 6.6 Milestones
 
 Ordered; each produces a runnable thing. No external project is a
-prerequisite. Estimates are for one engineer **[inferred]**.
+prerequisite. M1 is deliberately free of build risk; M2–M4 build the
+Graphite-Dawn pathway; M5–M7 turn it into the two target modes and harden
+it. Estimates are for one engineer **[inferred]**.
 
-1. **B1 — cdylib + Dart FFI spike (days, ~3–5).** The §2.1 ABI, CPU
-   renderer, headless. A plain Dart script loads a small HTML/CSS file,
-   renders it at t=0, writes a PNG. No window, no host. Exit criteria:
-   bytes out, image correct. (Blitz's `screenshot` example is the
-   reference — this milestone is mostly plumbing.)
-2. **B2 — render-target mode with a trivial host composite (week 1).**
-   Option A: feed B1's bytes to any host that can display a texture —
-   start with the simplest thing available (a host overlay pass, or even
-   an SDL3 texture blit for the spike). Add the event table (mouse +
-   key first). Exit criteria: hover/click on HTML elements works over a
-   host-drawn background; frame time recorded. This milestone answers
-   whether the CPU renderer is fast enough (§6.7 question 1).
-3. **B3 — swapchain mode on the SDL3 window (1–2 weeks).** Option B:
-   the Dawn compositor presents to the SDL3 window's native handle.
-   Start with the one-day macOS handle spike (layer vs NSView). Exit
-   criteria: HTML/CSS UI owns the window at vsync pace; Dawn linked and
-   the binary-size delta recorded.
-4. **B4 — perf and dirty-region (week).** Implement §2.1's frame gating
-   and §6.4's dirty-skip; measure CPU renderer cost at target sizes
-   (800×600 and one large window); add partial uploads if the copy
-   shows up in the profile. Exit criteria: numbers for §6.7's open
-   questions, and a static UI at ~zero per-frame cost.
-5. **B5 — hardening (1–2 weeks).** Resize, HiDPI scale changes, text
-   input (IME), the consumed-event hover query, accessibility surface,
-   a local-asset net provider, packaging (universal binaries, the
-   native-assets build hook). Exit criteria: the component survives a
-   resize and a HiDPI change without artifacts.
+1. **M1 — cdylib + Dart FFI spike, CPU renderer (days, ~3–5).** The
+   §2.1 ABI with `FZ_BACKEND_CPU`, headless. A plain Dart script loads a
+   small HTML/CSS file, renders it at t=0, writes a PNG. No window, no
+   host, no Skia build. Exit criteria: bytes out, image correct; the
+   headless render time recorded. (Blitz's `screenshot` example is the
+   reference — mostly plumbing.) This is the stepping stone: it validates
+   the cdylib boundary and the FFI shape every later milestone reuses.
+2. **M2 — Skia compiled with Graphite + Dawn (1–2 weeks).** Stand up the
+   build before any Rust: check out Skia with its Dawn dependency, set
+   the GN args (`skia_enable_graphite=true`, `skia_use_dawn=true`),
+   produce a macOS artifact, and render something with it (a small C++
+   tool is fine). Exit criteria: a Skia static library built with
+   Graphite-Dawn on macOS; build time and artifact size recorded.
+3. **M3 — rust-skia fork + dawn backend module (1–2 weeks).** Fork
+   rust-skia at a skia-safe revision compatible with Blitz's pin (0.97.x
+   today **[verified]**). Add the three pieces of §6.2: the
+   `skia_use_dawn` build support, the C++ wrapper + bindgen for
+   `DawnBackendContext`/`MakeDawn` and a `BackendTexture` from a
+   `WGPUTexture`, and `skia-safe/src/graphite/dawn.rs` next to `mtl.rs`
+   with a `dawn` feature. Exit criteria: a Rust example creates a Dawn
+   device, makes a Graphite context, renders offscreen, reads back —
+   the mirror of the existing `graphite_readback` example.
+4. **M4 — Blitz's Skia renderer wired to the fork (~1 week).** Point
+   `anyrender_skia` at the fork (a `[patch.crates-io]` redirect, or a
+   small fork of that crate too) and swap its image renderer's surface
+   from `surfaces::wrap_pixels` to a Graphite surface on a Dawn texture.
+   The painter code does not change — that is the §6.2 seam. Exit
+   criteria: one HTML/CSS frame rendered on the GPU through Dawn and
+   read back correctly; frame time recorded next to M1's CPU number.
+5. **M5 — swapchain mode on the SDL3 window (1–2 weeks).** Mode a: a
+   Dawn surface from the SDL3 window's native handle; Skia renders into
+   the swapchain texture; Dawn presents. Start with the one-day macOS
+   handle spike (layer vs NSView). Add the event table (mouse + key
+   first). Exit criteria: HTML/CSS UI owns the window at vsync pace;
+   the Dawn + Skia binary-size delta recorded.
+6. **M6 — render-target mode (week).** Mode b: an offscreen texture and
+   a trivial host composite — any host that can display a texture, even
+   an SDL3 texture blit for the spike. Both lanes: a host-provided Dawn
+   device (same device, zero copies) and our own device (one readback).
+   Exit criteria: hover/click on HTML elements works over a host-drawn
+   background; both lanes measured.
+7. **M7 — perf and hardening (1–2 weeks).** Dirty-region re-render and
+   skip; resize and HiDPI scale changes; text input (IME); the
+   consumed-event hover query; the accessibility surface; a local-asset
+   net provider; packaging (universal binaries, the native-assets build
+   hook, CI for the fork). Exit criteria: a static UI at ~zero per-frame
+   cost; the component survives a resize and a HiDPI change.
 
 ### 6.7 Risks and open questions
 
 Risks:
 
+- **The Skia+Dawn build.** ~100 MB class, GN/ninja toolchain, Dawn's
+  third-party dependencies. rust-skia's prebuilt binary cache has
+  nothing for a forked feature set — every CI machine builds from
+  source **[verified size class §4; inferred cache consequence]**.
+- **Fork maintenance.** rust-skia tracks a fast-moving Skia, and Blitz
+  pins skia-safe 0.97.x while the latest release is 0.99.0 **[verified]**.
+  Rebases land on us. Mitigation: keep the fork to one module plus build
+  flags, and try to upstream the dawn module **[inferred]**.
+- **Blitz's Skia renderer is the less-travelled path.** Its image
+  renderer is CPU-only today; the GPU backends it does have (Metal /
+  OpenGL / Vulkan, via Ganesh) serve its window renderer. Nobody runs it
+  on Graphite-Dawn **[verified]**. Feature parity with the Vello painter
+  — filters, blend modes, masks — must be checked, not assumed
+  **[inferred]**.
 - **Blitz is beta.** Its own README says many bugs and missing features;
   CSS coverage is tracked on their status page **[verified]**. We would
   be early adopters on a moving 0.x **[inferred]**.
 - **Platform-thread cost.** Stylo + taffy + parley run inline on the
-  calling thread. A big DOM or a heavy relayout can stall the app's
-  event loop **[inferred; measure in B2]**.
-- **The copy.** Option A pays one full-frame CPU copy per frame at every
-  resolution **[verified pattern, unmeasured cost]**.
-- **Binary size.** Even the CPU path brings stylo (a Servo component)
-  and its dependency tree (§6.1's count). Adding Dawn for modes a/A2
-  brings its static libraries too. "Small" is not the word for it
-  **[inferred]**.
+  calling thread, and Skia records the scene there too. A big DOM or a
+  heavy relayout can stall the app's event loop **[inferred; measure in
+  M5]**.
+- **The copy on the fallback lanes.** The CPU path and the no-host-device
+  readback each pay one full-frame copy per frame **[verified pattern,
+  unmeasured cost]**.
+- **Binary size.** Skia + Dawn sit on top of Blitz's stylo tree (§6.1's
+  package count). "Small" is not the word for it **[inferred]**.
 - **Build complexity.** A Rust cdylib in a native-assets build hook,
-  plus Dawn linked beside it (C++ toolchain, static-lib quirks), with
-  matching macOS universal binaries **[inferred]**.
-- **Blitz on wgpu (if ever taken).** Second WebGPU stack, larger
-  binary, a new class of driver-maturity issues **[inferred]**.
+  plus a forked skia-safe that compiles Skia + Dawn, with matching
+  macOS universal binaries **[inferred]**.
 
 Open questions:
 
-1. Is the CPU renderer fast enough at 800×600 for a HUD-sized DOM?
-   (B2 measures this; it decides the whole GPU question.)
-2. How complete is Blitz's CSS for our UI needs — flexbox, grid,
-   position, transforms, overflow? Their status page tracks it; our
-   layouts must be checked against it **[verified page exists]**.
-3. Text quality: parley + swash on macOS — kerning, emoji, CJK.
-   Untested by us **[inferred]**.
-4. Accessibility: blitz-shell has an accesskit integration **[verified]** —
+1. Which rust-skia revision does the fork target — one close to
+   Blitz's 0.97.x pin, or current master with a skia-safe upgrade on
+   Blitz's side? (M3's first task.)
+2. Does `SkiaScenePainter` cover everything Blitz's Vello painter
+   covers — CSS filters, blend modes, masks? Test with a stress page in
+   M4 **[verified the painter exists; parity unverified]**.
+3. Does Graphite-Dawn on macOS (Dawn's Metal backend) render everything
+   Blitz paints, at speed? (M4/M5 measure.)
+4. Dawn surface creation from SDL3 handles: which handle does Dawn want
+   on macOS — the `CAMetalLayer` or the NSView? And what are Dawn's
+   thread rules for surface creation? (M5's opening spike.)
+5. Present-mode behavior: does `Fifo` present block as expected on all
+   three desktop platforms, and how does it interact with a host's own
+   presentation in mode b? (M5/M6.)
+6. Whose Dawn device wins in mode b when a host exposes one — and does
+   any host we care about actually expose one today? **[inferred: most
+   don't; check per host]**
+7. Final binary size and CI build time for the cdylib (Skia + Dawn +
+   the stylo tree). (M2 gives the first number; M7 the final one.)
+8. Accessibility: blitz-shell has an accesskit integration **[verified]** —
    can it survive without winit, driven from our cdylib? Unknown.
-5. Networking: `DocumentConfig` takes a `net_provider`; for local assets
+9. Networking: `DocumentConfig` takes a `net_provider`; for local assets
    we need a custom one. Whether Blitz's own net provider can be pointed
    at a local asset store is unverified **[verified the field exists]**.
-6. Does the CPU renderer path pull in any hidden GPU dependency?
-   (It should not — the headless example uses no GPU **[inferred from
-   the example]**.)
-7. macOS HiDPI: viewport scale vs. buffer size — does Blitz give us the
-   physical-pixel buffer we want to upload?
-8. Dawn surface creation from SDL3 handles: which handle does Dawn want
-   on macOS — the `CAMetalLayer` or the NSView? And what are Dawn's
-   thread rules for surface creation? (B3's opening spike.)
-9. Dawn from Rust via `webgpu.h`, or a small C++ library? Both work on
-   paper; the choice follows the build hook that ends up simpler
-   **[inferred]**.
-10. Present-mode behavior: does `Fifo` present block as expected on all
-    three desktop platforms, and how does it interact with the host's
-    own presentation when both exist (option B with host content)?
+10. macOS HiDPI: viewport scale vs. buffer size — does Blitz give us the
+    physical-pixel surface we want?
+11. Is the CPU renderer fast enough to stay a credible fallback at
+    800×600 for a HUD-sized DOM? (M1 records the first number.)
 
 ### 6.8 What this does to the rest of the plan
 
@@ -1187,12 +1351,14 @@ Open questions:
   the two-implementations constraint and priced the renderers; §5
   reopened framework adoption with window ownership allowed and found
   the candidates. Blitz won (§6.1) — HTML/CSS, permissive license,
-  active, and the only one with a proven headless CPU path.
-- **Dawn is our compositor's API, not Blitz's backend.** Nothing in this
-  plan moves toward Blitz-on-Dawn (impossible today, §6.2) nor toward
-  device sharing. The day device sharing becomes a hard requirement, the
-  answer is a host that exposes its Dawn device, or the Skia
-  Graphite / ImGui-on-Dawn alternatives of §3.
+  active, and the only one with a proven headless CPU path. This
+  revision then moved the destination: from the CPU bridge to Blitz's
+  Skia renderer on Graphite-Dawn (§1.3). Skia entered the plan through
+  Blitz's renderer, not as a standalone canvas API.
+- **Dawn is now Blitz's backend, not just our layer's API.** The cdylib
+  owns the Dawn instance and device; Skia Graphite draws on it; Vello
+  stays out; wgpu stays out. Device sharing with a host remains the
+  §2.3 story — one Dawn device, handed over.
 - **§7 (the Dart-side seam) is unchanged in spirit:** the component sits
   beside it, not through it.
 
@@ -1220,11 +1386,12 @@ Two things to protect while this lands:
    an RGBA8 buffer." Anything more specific re-couples the component to
    one host — the thing this revision removed.
 
-**First milestone: B1 (§6.6).** A Dart script loads HTML, renders one
+**First milestone: M1 (§6.6).** A Dart script loads HTML, renders one
 frame headless, writes a PNG. It proves the cdylib boundary, the FFI
-shape, and the CPU renderer, with no window and no host. Every later
-decision (mode order, dirty gating, Dawn necessity) depends on its
-numbers, so nothing bigger should be scheduled before it.
+shape, and the CPU fallback renderer, with no window, no host, and no
+Skia build. Every later decision (dirty gating, lane choice, the CPU
+renderer's credibility as fallback) depends on its numbers. M2, the
+Skia+Dawn build, may start in parallel — it touches no Rust.
 
 ## 8. Risks, open questions, prototype order
 
@@ -1233,29 +1400,33 @@ view.
 
 ### Risks
 
-- **Dawn binary size and build.** Dawn's static libraries (Tint,
-  abseil, platform glue) are the biggest unknown in modes a and A2.
-  Mitigation: measure in B3 before committing to swapchain mode; A1
-  needs no Dawn at all.
+- **The Skia+Dawn build and the fork.** The biggest unknown in every
+  GPU lane: a ~100 MB-class Skia build with Dawn's static libraries
+  (Tint, abseil, platform glue), compiled from source because the fork
+  defeats rust-skia's prebuilt cache, and a fork to rebase against two
+  moving upstreams (rust-skia, Blitz's pins). Mitigation: M2 measures
+  the build before M3/M4 commit to it; the fork stays at one module
+  plus build flags. The CPU lane (A1) needs none of it.
 - **Blitz maturity and API churn.** 0.3.0-beta.1 with a pinned Taffy
   fork **[verified, §6.1]**; expect breaking changes on update.
 - **Single-thread cost.** Everything runs on the platform thread
-  (§2.1). A heavy page stalls the app loop. Mitigation: measure in B2;
+  (§2.1). A heavy page stalls the app loop. Mitigation: measure in M5;
   keep HUD-sized DOMs; cache layouts.
 - **Two presentation paths (option B with host content).** Pacing a
   Dawn present against a host's present in one process is uncharted
   here; avoid by keeping option B windows UI-only **[inferred]**.
-- **The copy at scale.** 4K buffers make A1's per-frame copy visible.
-  Mitigation: dirty-skip first, partial uploads second (B4).
+- **The copy at scale.** 4K buffers make the readback lane's per-frame
+  copy visible. Mitigation: prefer the same-device lane; dirty-skip
+  first, partial uploads second (M7).
 
 ### Open questions
 
-1. All ten from §6.7.
+1. All of §6.7's.
 2. Does the component ever need multi-window (option C) on macOS, given
    the winit main-thread block makes in-process C impossible there
    **[verified, §6.3]**?
-3. Whose Dawn device wins in A2 when a host exposes one — and does any
-   host we care about actually expose one today? **[inferred: most
+3. Whose Dawn device wins in mode b when a host exposes one — and does
+   any host we care about actually expose one today? **[inferred: most
    don't; check per host]**
 4. Is there a browser story? The cdylib is native; Blitz itself compiles
    to WASM, so a web variant of the frontend is conceivable but out of
@@ -1263,8 +1434,9 @@ view.
 
 ### Prototype order
 
-§6.6's B1–B5, in order. Each step produces a runnable thing and a
-number; no step depends on any external project's artifact.
+§6.6's M1–M7, in order (M2 may run in parallel with M1 — it touches no
+Rust). Each step produces a runnable thing and a number; no step depends
+on any external project's artifact.
 
 ## Cross-references
 
@@ -1295,13 +1467,30 @@ number; no step depends on any external project's artifact.
   README, issue search), gfx-rs/wgpu (`wgpu/Cargo.toml` features,
   `src/api/surface.rs` `SurfaceTarget`), and rust-windowing/winit
   (`winit-appkit/src/event_loop.rs`).
+- §6.2's Skia-pathway facts were read on 2026-08-16 from the
+  DioxusLabs/anyrender repo (`crates/anyrender_skia`: `Cargo.toml`,
+  `src/image_renderer.rs`, `src/scene.rs`, `src/metal.rs`,
+  `src/window_renderer.rs`), the rust-skia/rust-skia repo at `master`
+  (repo tree search for "dawn" — zero hits; `skia-safe/Cargo.toml`
+  features; `skia-safe/src/graphite.rs` + `graphite/mtl.rs`; the
+  `graphite_offscreen*`/`graphite_readback` examples;
+  `skia-bindings/Cargo.toml`; `skia-bindings/build_support/skia/
+  config.rs`), the google/skia repo at `main`
+  (`include/gpu/graphite/dawn/DawnBackendContext.h`;
+  `src/gpu/graphite/dawn/` listing; `gn/skia.gni`'s `skia_use_dawn`
+  and its Graphite-only assert), and crates.io (skia-safe 0.99.0
+  latest release).
 
 ## Updating this plan
 
-When B1 lands, replace §2.1's sketch with the ABI as actually built and
-record the headless render time. When B2 lands, record the CPU renderer
-frame cost at the test sizes and whether dirty-skip was needed. When B3
-lands, record the Dawn binary-size delta, the macOS surface answer
-(layer vs NSView), and the present-mode behavior. If the component is
-abandoned, note why here — the C ABI of §2.1 is the seam that would let
-a different HTML/CSS engine slot in without touching the Dart frontend.
+When M1 lands, replace §2.1's sketch with the ABI as actually built and
+record the headless render time. When M2 lands, record the Skia
+Graphite+Dawn build time and artifact size on macOS. When M3 lands,
+record the fork's surface (base revision, module list) and whether it
+can track Blitz's skia-safe pin. When M4 lands, record the GPU frame
+time next to the CPU number and any painter parity gaps. When M5 lands,
+record the Dawn + Skia binary-size delta, the macOS surface answer
+(layer vs NSView), and the present-mode behavior. If the Graphite-Dawn
+pathway is abandoned, note why here — the M1 CPU bridge remains as the
+fallback component, and the C ABI of §2.1 is the seam that lets a
+different HTML/CSS engine slot in without touching the Dart frontend.
