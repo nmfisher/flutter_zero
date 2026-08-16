@@ -37,6 +37,13 @@ This is a proposal only. No code has been changed.
   pick is **Dear ImGui on Dawn** — the only widget stack that can sit
   on Filament's Dawn, has a C ABI (cimgui + small shim), and ships an
   SDL3 platform backend. Immediate mode, but everything else fits.
+- **Blitz (HTML/CSS on WebGPU) cannot use Dawn** (§6). Its whole GPU path
+  is vello → wgpu, and wgpu has no Dawn backend. But Blitz ships a CPU
+  renderer (proven headless: HTML → RGBA8 bytes), so the recommended
+  integration is **§6 option A: headless Blitz → RGBA8 buffer → Filament
+  texture** — the exact handoff `thermion_ui` already runs, and with the
+  CPU renderer there is still only one GPU stack in the process
+  (Filament's Dawn). ~1–2 weeks to a composite HTML HUD over the lit cube.
 - **Recommended combination:** Filament-on-WebGPU as the single GPU stack
   (Option A, then Option C1), with the UI renderer from
   `UI_RENDERER_PLAN.md` compiled to WGSL instead of MSL/GLSL/SPIR-V.
@@ -728,7 +735,10 @@ search surfaced only small projects (<350 stars, most started in 2026)
   interop) **[verified]**. No C API **[verified]**.
 - It is an HTML/CSS engine, not a widget toolkit — adopting it means
   writing UI in HTML/CSS, and Dioxus (RSX) for logic. Big departure
-  from a Dart widget tree **[inferred]**.
+  from a Dart widget tree **[inferred]**. *(Update 2026-08-16: the
+  renderer is now the `anyrender` crate family, not
+  `blitz-renderer-vello`, and it includes a CPU renderer. Blitz became
+  Nick's pick for a deep-dive — see §6 for the full integration plan.)*
 
 **Vizia** (vizia/vizia) — **excluded.** The README says rendering
 "leverages the powerful and robust skia library" — it moved off
@@ -838,7 +848,408 @@ split) or **Dear ImGui on Dawn for immediate** (cheapest binding, only
 Dawn-compatible option, SDL3 done). And the earlier conclusion in §4
 stands for renderers under our seam: Vello remains the pick there.
 
-## 6. The Canvas/DisplayList seam, and the first milestone
+## 6. Blitz + WebGPU integration plan
+
+Nick's goal: an **HTML/CSS widget layer** for Flutter Zero, running on a
+WebGPU backend. Preferred implementation: **Dawn**, because Filament/thermion
+bundles Dawn, and two different WebGPU implementations cannot share a GPU
+device (§4). This section is the plan. Everything below was read from
+upstream source on 2026-08-16 (shallow clone of `DioxusLabs/blitz`, plus the
+`DioxusLabs/anyrender`, `linebender/vello`, `gfx-rs/wgpu`, and
+`rust-windowing/winit` repos). Claims are **[verified]** (read from source
+this round) or **[inferred]**.
+
+### 6.1 Verified facts about Blitz
+
+Blitz is an **HTML/CSS rendering engine** from the Dioxus project. It is not
+a widget toolkit. You write the UI in HTML and CSS; layout, styling, text,
+and painting all happen inside Blitz.
+
+| Layer | What Blitz uses | Source |
+|---|---|---|
+| CSS | Servo's **stylo** 0.20 | workspace `Cargo.toml` **[verified]** |
+| Layout | **Taffy** (DioxusLabs fork, pinned rev `864b4fd…`) via the `stylo_taffy` package; `blitz-dom` glues CSS results to it | **[verified]** |
+| Text | **parley** 0.10 (shaping + layout) | **[verified]** |
+| Paint | `blitz-paint` — "Paint a Blitz Document using anyrender" | **[verified]** |
+| Renderer | **anyrender** 0.12 abstraction, with `anyrender_vello` 0.13 (GPU), `anyrender_vello_cpu` 0.15 (CPU), `anyrender_vello_hybrid` 0.9, `anyrender_skia` 0.10 | **[verified]** |
+| GPU stack | **wgpu 29** (vello pins wgpu 29.0.3) | **[verified]** |
+| Windowing | `blitz-shell` on **winit** | **[verified]** |
+
+This corrects §5, which described Blitz's renderer as
+`blitz-renderer-vello`; upstream has since moved to the anyrender crate
+family **[verified]**. That change matters to us — it means Blitz now has a
+pluggable renderer abstraction, including a **CPU renderer**.
+
+State of the project:
+
+- Version **0.3.0-beta.1** (`blitz` and `blitz-shell` on crates.io,
+  published 2026-07-10); repo pushed 2026-08-15 **[verified]**. The README
+  calls it beta: "many bugs and missing features" **[verified]**.
+- License **Apache-2.0 OR MIT** at the repo root **[verified]**.
+- Platforms: runnable builds shipped for **Windows / macOS / Linux /
+  Android** — macOS is first-class **[verified: README downloads page]**.
+- Size: the workspace `Cargo.lock` lists **897 packages** for the whole
+  workspace (that includes their browser app and test suites). Our shim
+  needs a subset, but stylo + taffy + parley + vello + wgpu dominate. Expect
+  a linked library in the tens of MB **[inferred; count verified]**.
+- **No C API.** There is no `extern "C"` anywhere in the packages or
+  examples, and no cbindgen setup. Rust only, so a **Rust `cdylib` shim**
+  is required for Dart FFI **[verified]**.
+
+Three ways to drive Blitz, all verified from source:
+
+1. **Headless, no window at all.** `examples/screenshot.rs`:
+   `HtmlDocument::from_html(html, DocumentConfig { base_url, net_provider,
+   viewport })` → `document.resolve(time)` → `paint_scene(scene, doc,
+   scale, w, h, 0, 0)` → `render_to_buffer::<VelloCpuImageRenderer, _>(…)`
+   → RGBA8 pixels → PNG **[verified]**. No window, no event loop, no winit.
+2. **Offscreen GPU buffer.** `anyrender_vello`'s `VelloImageRenderer`
+   creates its own `WGPUContext`, renders the scene with vello
+   (`use_cpu: false`) into a storage texture, and copies the result into a
+   CPU `Vec<u8>` via `render_to_vec(…)` **[verified]**. This is Blitz's GPU
+   path into an ordinary byte buffer.
+3. **Windowed.** `VelloWindowRenderer` + winit event loop
+   (`BlitzApplication`, `WindowConfig`). The frame loop in `blitz-shell`'s
+   `redraw()`: `doc.resolve(t)` → `paint_scene(...)` →
+   `renderer.render(...)`, and it only requests another frame when the
+   document `is_animating()` **[verified]** — a dirty-driven, not
+   render-always, loop.
+
+Input is decoupled from winit. `blitz-shell` converts winit events into
+`UiEvent` values (`PointerMove` / `PointerUp` / `PointerDown` /
+`PointerCancel` / `Wheel` / `KeyDown` / `KeyUp` / `Ime` /
+`AppleStandardKeybinding`, from `blitz-traits`) and feeds them to
+`doc.handle_ui_event(event)` **[verified]**. We can construct those events
+ourselves. SDL3 → `UiEvent` is a small, boring translation table.
+
+Two more verified details we rely on below:
+
+- **Custom widgets can get the wgpu device.** The `wgpu_texture` example
+  downcasts the renderer context to a `DeviceHandle` and renders its own
+  wgpu pipeline into the Blitz scene **[verified]**. (This is how 3D
+  content could someday be drawn *inside* an HTML page.)
+- **Surfaces can come from raw handles.** Blitz's `WGPUContext::
+  create_surface` takes wgpu's `SurfaceTarget`, which includes
+  window-handle variants and an unsafe raw-handle variant
+  (`SurfaceTargetUnsafe`) **[verified]**. On macOS, wgpu documents that
+  surface creation must happen on the main thread **[verified]** — fine for
+  us, everything already runs on the platform thread.
+
+### 6.2 The Dawn verdict
+
+The question: can Blitz render through **Dawn**, the same WebGPU
+implementation Filament bundles? The chain, verified link by link:
+
+1. Blitz's GPU renderer is `anyrender_vello` → **vello** **[verified]**.
+2. Vello uses **wgpu** for all GPU access. Its workspace pins
+   `wgpu = 29.0.3` **[verified]**. There is no other GPU backend: the old
+   custom HAL (`piet-gpu-hal`) was dropped in favor of wgpu, and the README
+   states "using [`wgpu`] for GPU access" **[verified]**. `vello_cpu` is
+   the CPU variant — not a Dawn path **[verified]**.
+3. A search of vello's issues for "Dawn" returns **zero** results
+   **[verified]**. No backend trait exists to swap in.
+4. **wgpu itself has no Dawn backend.** Its `Cargo.toml` backend features
+   are `dx12`, `metal`, `vulkan`, `gles`, `webgpu` (WASM-only), and
+   `webgl` (WASM-only) **[verified]**. Nothing targets native Dawn.
+
+**Verdict: "Blitz on Dawn" is not achievable today.** Not with a flag, not
+with a small patch. Blitz's whole GPU path is compiled against wgpu's Rust
+API (`Device`/`Queue`/`Texture` types), not against the standard
+`webgpu.h` C API that Dawn and wgpu-native share. Porting vello to Dawn
+would mean reimplementing vello's renderer.
+
+What *is* achievable, stated plainly:
+
+- **Blitz on wgpu** — the only native GPU path Blitz has.
+- **Blitz on CPU** (`anyrender_vello_cpu`) — no GPU stack at all inside
+  Blitz. The screenshot example uses exactly this **[verified]**. This is
+  the interesting one for us: on the buffer-handoff path (option A below)
+  the CPU renderer means **no second WebGPU stack in the process**.
+  Filament keeps Dawn as the only GPU stack **[inferred — the CPU renderer
+  exists and is proven; its speed at our frame sizes is unmeasured]**.
+- **A different UI stack on Dawn**: Dear ImGui's `imgui_impl_wgpu`
+  compiled with `IMGUI_IMPL_WEBGPU_BACKEND_DAWN` (§5), or Skia Graphite
+  (§4). If sharing a device with Filament ever becomes the hard
+  requirement, Blitz is the wrong tool and ImGui is the cheap answer.
+
+So the real choice for Blitz is: **CPU renderer + buffer handoff (one GPU
+stack, Filament's Dawn)**, or **wgpu renderer (GPU quality, second WebGPU
+stack, still a CPU copy to reach Filament)**. Device sharing is impossible
+in both — §4's conclusion stands.
+
+### 6.3 Integration options
+
+#### Option A — headless Blitz → RGBA8 buffer → Filament texture
+*(recommended first step)*
+
+Same shape as the pipeline `thermion_ui` already runs: something produces
+RGBA8 pixels, we upload them as a Filament texture, and composite the UI
+View over the 3D View. Here, "something" is Blitz.
+
+```
+Dart (platform thread, every frame)
+  ├─ SDL3 poll → translate events → blitz_dispatch(events[])   [Rust]
+  │       Rust: doc.handle_ui_event(UiEvent)                    [verified API]
+  ├─ FrameScheduler tick → blitz_render(time_ms) → RGBA8 bytes  [Rust]
+  │       Rust: doc.resolve(t) → paint_scene(...) →
+  │              render_to_buffer(VelloCpuImageRenderer)   — no wgpu at all
+  │              or render_to_vec(VelloImageRenderer)      — wgpu offscreen
+  │       (pointer returned is borrowed; copied into a Dart Uint8List)
+  └─ Texture.setImage(bytes) → UI View (renderOrder 1) over 3D View →
+     Filament endFrame — presentation and vsync unchanged
+```
+
+- **What we build:** a Rust `cdylib` exposing roughly this C ABI (sketch;
+  ~300–600 lines of Rust **[inferred]**):
+
+  ```c
+  typedef struct blitz_engine_t blitz_engine_t;
+
+  blitz_engine_t* blitz_create(int width, int height, float hidpi_scale,
+                               int use_gpu);          /* 0 = vello_cpu */
+  void  blitz_load_html(blitz_engine_t*, const char* html,
+                        const char* base_url);
+  void  blitz_set_viewport(blitz_engine_t*, int width, int height,
+                           float hidpi_scale);
+  void  blitz_dispatch(blitz_engine_t*, const blitz_event_t* events,
+                       int count);   /* mouse, key, wheel, text */
+  const uint8_t* blitz_render(blitz_engine_t*, double time_ms,
+                              int* out_width, int* out_height);
+  void  blitz_destroy(blitz_engine_t*);
+  ```
+
+  Dart side: `ffigen` over the header, or six hand-written FFI lookups —
+  either is days **[inferred]**. Threading is trivial: everything is
+  called from the platform thread, like every other FFI call we make.
+- **Input:** SDL3 events → `blitz_event_t` → `UiEvent`. Click, move,
+  wheel, key, IME text. No winit involved **[verified that `UiEvent` is
+  the input boundary]**. Focus/zoom niceties from blitz-shell (pinch-zoom,
+  devtools hotkeys) are ours to re-add or skip.
+- **Vsync / frame scheduling:** nothing changes. Our `FrameScheduler`
+  still owns the tick; Filament still owns presentation. Blitz is a pure
+  pixel producer. Re-render only when Blitz reports an animation is
+  running or an event arrived (blitz-shell's own `is_animating()` gate
+  **[verified]**), or pay for a wasted layout every frame.
+- **The DisplayList seam:** Blitz does **not** go through it, and cannot —
+  a `DisplayList` is a flat list of draw commands; HTML/CSS brings its own
+  layout, styling, and retained DOM. Blitz sits **beside** the seam: the
+  `RecordingCanvas` → `DisplayList` → executor path stays alive for any
+  Dart-drawn UI, and the Blitz texture is just another input to the UI
+  View. The two can coexist in one frame.
+- **wgpu-vs-Dawn interop:** none needed. One CPU copy per frame. With the
+  CPU renderer there is no wgpu in the process at all — the only option
+  that keeps a single GPU stack.
+- **Costs:** the copy itself (800×600 RGBA8 ≈ 1.9 MB/frame; 4K ≈
+  33 MB/frame — fine at the first size, must be measured at the second
+  **[inferred]**), and layout+style+paint running on the platform thread.
+  Stylo is a real CSS engine; per-frame cost for a realistic HUD is
+  unknown **[inferred; measure in milestone B1]**.
+
+#### Option B — Blitz renders into a wgpu surface on the SDL3 window
+
+Blitz draws HTML/CSS **directly into the Flutter Zero window**: the shim
+creates a wgpu surface from the SDL3 window's raw handle and presents it
+itself.
+
+```
+Dart (platform thread, every frame)
+  ├─ SDL3 poll → blitz_dispatch(events[])
+  ├─ tick → blitz_render_to_surface(time_ms)        [Rust]
+  │       Rust: doc.resolve(t) → paint_scene(...) →
+  │              WGPUContext.create_surface(SurfaceTarget from the SDL3
+  │              window's raw handle) → SurfaceRenderer → present
+  └─ Filament: CANNOT also present to this window — one presentation
+         path per window. So either
+         B1: Filament renders 3D offscreen → readback → bytes → Blitz
+             draws them (as a custom widget / <img>), i.e. the option A
+             copy inverted and paid twice, or
+         B2: this window has no Filament content at all.
+```
+
+- **What we build:** the option A shim plus a surface-creation entry point
+  (`blitz_attach_surface(raw_window_handle, raw_display_handle)`), a
+  `SurfaceRenderer` instead of a `BufferRenderer`, and resize handling
+  (surface reconfigure on SDL window events).
+- **Input:** identical to option A.
+- **Vsync / frame scheduling:** presentation moves from Filament to wgpu.
+  A wgpu surface presents in `Fifo` mode by default, which paces to vsync
+  **[verified: wgpu's default present mode; behavior on our SDL3 window
+  untested]**. Our scheduler calls `blitz_render_to_surface` and the
+  present blocks — frame pacing now lives behind the shim.
+- **The DisplayList seam:** replaced for this window, same as option A.
+- **wgpu-vs-Dawn interop:** this is the **worst** interop position of the
+  three. Blitz (wgpu) and Filament (Dawn) are both in the process, both
+  driving the GPU every frame, with no way to share devices, textures, or
+  the swapchain (§4). B1 re-introduces the CPU copy anyway. B2 means no 3D
+  on the window — which drops the reason Filament is there.
+- **Plumbing risk:** the raw-handle surface must be created on the main
+  thread on macOS **[verified: wgpu documents the panic]**, and the
+  macOS handle story has a wrinkle — wgpu's Metal backend wants an
+  NSView/NSWindow handle and creates its own `CAMetalLayer`, while our
+  existing code passes a `CAMetalLayer` from `SDL_Metal_GetLayer` to
+  Filament **[verified for our side; the wgpu side needs a one-day spike
+  to confirm which handle it accepts — `SurfaceTargetUnsafe` takes raw
+  window+display handles, but Metal layer reuse is not documented there]**
+  **[inferred]**. On Linux/X11 the raw-handle path is standard
+  **[inferred from `SurfaceTargetUnsafe`'s design]**.
+
+This option only pays off if Flutter Zero becomes "an HTML/CSS app with a
+wgpu swapchain" — Filament demoted or gone. It is not a good *first* step.
+
+#### Option C — Blitz owns its own window (winit)
+
+Run blitz-shell as designed: it creates its own window, own event loop,
+own surface.
+
+```
+Rust cdylib: blitz-shell application (winit event loop)
+  ├─ own OS window, own wgpu surface, own vsync (RedrawRequested)
+  └─ HTML/CSS UI lives entirely here
+Dart: SDL3 window + Filament 3D exactly as today
+Link: message passing (Dart FFI → Rust mailbox; Rust → Dart via a
+      NativeCallable / SendPort)
+```
+
+- **What we build:** the thinnest Rust of the three — blitz-shell already
+  does window, input, and rendering **[verified]**. We expose
+  `blitz_app_start(html)`, `blitz_app_message(...)`, and a callback into
+  Dart.
+- **The blocker, verified:** **on macOS this cannot run in-process.**
+  winit's macOS backend panics unless the event loop is created on the
+  process main thread — `MainThreadMarker::new().expect("on macOS,
+  `EventLoop` must be created on the main thread!")`
+  (`winit-appkit/src/event_loop.rs:362`) **[verified]**. SDL3's macOS
+  video backend has the same main-thread requirement **[verified:
+  UI_BRAINSTORMING's SDL affinity writeup]**. Dart already runs on that
+  thread. Two windowing toolkits cannot both own `NSApplication`.
+  In-process option C is therefore **macOS-blocked**. The variants:
+  - **C-process:** run the Blitz UI as a **separate process** (spawned by
+    the engine), talk over a socket or pipe, share nothing. Works, but it
+    is an IPC integration — input forwarding, window z-order, and
+    lifecycle all become our problem, and there is no texture sharing
+    across processes **[inferred]**.
+  - **C-replace:** give up SDL3 and let Blitz own the one window. Then
+    Filament must attach to *Blitz's* surface — which brings back the
+    wgpu-vs-Dawn device problem, or Filament renders offscreen with a
+    readback into Blitz's custom-widget path (the `wgpu_texture` example
+    proves a custom wgpu pipeline can draw inside the scene, but a
+    Filament/Dawn device still cannot hand pixels to a wgpu device
+    without a copy **[verified example exists; interop inference from
+    §4]**).
+- **Vsync:** owned by winit/blitz-shell; our `FrameScheduler` is not in
+  the loop for that window at all.
+- **The DisplayList seam:** untouched — Blitz is a separate window with
+  its own everything.
+- **Where it fits:** a second window (a debugger, an inspector, a
+  web-content panel) is the honest use case **[inferred]**.
+
+### 6.4 Comparison
+
+| | A: buffer handoff | B: wgpu surface on our window | C: own window |
+|---|---|---|---|
+| Window | SDL3 (ours) | SDL3 (ours), but presented by wgpu | winit (Blitz's) |
+| Filament 3D under the UI | yes, unchanged | not on this window (or pay two copies) | yes, separate window |
+| GPU stacks in process | **1 with CPU renderer; 2 with GPU renderer** | 2 (Dawn + wgpu), both active | 1–2 depending on variant |
+| Copies per frame | 1 (Blitz→Filament) | 0 if no 3D; 2 with 3D | 0 between windows |
+| macOS viable in-process | yes | probably (surface spike needed) | **no** (winit main-thread panic) |
+| Shim size | ~300–600 LOC Rust + FFI | A + surface attach/resize | smallest Rust, biggest architecture |
+| Event loop owner | ours (unchanged) | ours; present blocks | winit |
+| DisplayList seam | beside it (kept) | replaced for this window | untouched |
+
+### 6.5 Milestones
+
+Ordered; each produces a runnable thing. Estimates are for one engineer,
+assuming the thermion WebGPU artifact from §1 is already usable.
+
+1. **B1 — headless pixel proof (days, ~3–5).** Rust `cdylib` with the
+   option A API, CPU renderer only. A plain Dart script loads a small
+   HTML/CSS file, renders it at t=0, writes a PNG. No SDL, no Filament.
+   Exit criteria: bytes out, image correct. (The screenshot example is the
+   reference — this milestone is mostly plumbing **[inferred]**.)
+2. **B2 — composite over Filament (week 1).** Wire the same bytes into
+   `thermion_ui`'s texture path; run the existing demo with an HTML HUD
+   over the lit cube. Add the SDL3 → `UiEvent` table (mouse + key first).
+   Exit criteria: hover/click on HTML elements works; frame time recorded.
+   Decide here whether the CPU renderer is fast enough — if yes, we are
+   done with GPU-stack questions entirely.
+3. **B3 — animated + IME (week 2).** CSS transitions/animations (respect
+   `is_animating()` to avoid re-rendering static frames), text input,
+   HiDPI scale changes, resize. Exit criteria: a text field works inside
+   the HUD.
+4. **B4 (optional) — GPU renderer swap (days, ~2–3).** Flip
+   `use_gpu` to 1: `VelloImageRenderer` instead of CPU. Same Dart code.
+   Measure: is the wgpu offscreen render + readback faster than CPU paint
+   at our sizes, and what does the second WebGPU stack cost in memory and
+   binary size? Keep whichever wins **[inferred: this is a measurement,
+   not a rewrite]**.
+5. **B5 (only if 3D-in-HTML becomes a requirement) — option B spike
+   (week+).** Raw-handle surface on the SDL3 window, one-day macOS handle
+   spike first. Stop and re-evaluate before committing.
+6. **Option C — never in-process on macOS.** If a second window is
+   wanted, prototype C-process (separate process + pipe) as a debug tool
+   only.
+
+### 6.6 Risks and open questions
+
+Risks:
+
+- **Blitz is beta.** Its own README says many bugs and missing features;
+   CSS coverage is tracked on their status page **[verified]**. We would
+  be early adopters on a moving 0.x **[inferred]**.
+- **Platform-thread cost.** Stylo + taffy + parley run inline on our only
+  thread. A big DOM or a heavy relayout could stall SDL and Dart
+  **[inferred; measure in B2]**.
+- **The copy.** One full-frame CPU copy per frame is the price of option
+  A at every resolution **[verified pattern, unmeasured cost]**.
+- **Binary size.** Even the CPU path brings stylo (a Servo component) and
+  its dependency tree; the workspace lock has 897 packages. Our subset is
+  smaller, but "small" is not the word for it **[inferred]**.
+- **Build complexity.** A Rust cdylib in a native-assets build hook, next
+  to thermion's C++ hooks, with matching macOS universal binaries
+  **[inferred]**.
+- **wgpu if we take the GPU renderer.** Second WebGPU stack, larger
+  binary, and the same class of driver-maturity issues §1 documented for
+  Dawn, now on the wgpu side **[inferred]**.
+
+Open questions:
+
+1. Is `VelloCpuImageRenderer` fast enough at 800×600 for a HUD-sized DOM?
+   (B1/B2 measure this; it decides the whole GPU question.)
+2. How complete is Blitz's CSS for our UI needs — flexbox, grid,
+   position, transforms, overflow? Their status page tracks it; our
+   layouts must be checked against it **[verified page exists]**.
+3. Text quality: parley + swash on macOS — kerning, emoji, CJK. Untested
+   by us **[inferred]**.
+4. Accessibility: blitz-shell has an accesskit integration **[verified:
+   `accessibility.rs`]** — can it survive without winit, driven from our
+   shim? Unknown.
+5. Networking: `DocumentConfig` takes a `net_provider`; for local assets
+   we need a custom one (no network in the engine). Their `blitz-net`
+   exists; whether it can be pointed at a local asset store is unverified
+   **[verified the field exists; the provider unverified]**.
+6. Does `blitz_render` need to own a wgpu context at all in CPU mode?
+   (It should not — confirm no hidden wgpu dependency in the CPU renderer
+   path **[inferred from screenshot.rs using it with no GPU]**.)
+7. macOS HiDPI: viewport scale vs. buffer size — does Blitz give us the
+   physical-pixel buffer we want for `Texture.setImage`?
+
+### 6.7 What this does to the rest of the plan
+
+- **§2/§7 unchanged.** Option A (thermion WebGPU) and the first milestone
+  are still the opening moves. Blitz does not replace them; it rides the
+  same RGBA8 path `thermion_ui` already runs.
+- **§5's recommendation gains a footnote.** For an *adopted framework*,
+  Blitz is now the third candidate alongside Floem (retained toolkit) and
+  Dear ImGui (immediate, Dawn-capable) — with a unique pitch: full CSS,
+  a CPU renderer that avoids the two-GPU-stacks problem, and a proven
+  headless mode. Its costs are equally clear: beta quality, HTML/CSS
+  instead of Dart widgets, and no Dawn path **[inferred]**.
+- **Dawn remains Filament's stack only.** Nothing in the Blitz plan moves
+  toward device sharing; the day device sharing becomes a requirement,
+  the answer is ImGui-on-Dawn (§5) or the Skia Graphite escape hatch
+  (§4), not Blitz.
+
+## 7. The Canvas/DisplayList seam, and the first milestone
 
 The seam is already right, and this is the main reason the proposal is
 cheap. `RecordingCanvas` produces a `DisplayList`; a
@@ -886,7 +1297,7 @@ later decision (C1 vs C2, Linux timing, whether to keep Metal as the
 default) depends on those answers, so nothing bigger should be
 scheduled before it.
 
-## 7. Risks, open questions, prototype order
+## 8. Risks, open questions, prototype order
 
 ### Risks
 
@@ -968,11 +1379,23 @@ scheduled before it.
   and cimgui's `cimgui_impl.h`, lapce/floem and DioxusLabs/blitz
   READMEs, vizia/vizia and marc2332/freya repo descriptions, and the
   crates.io / GitHub releases APIs for version dates.
+- §6 facts were read on 2026-08-16 from a shallow clone of
+  DioxusLabs/blitz (workspace + packages' `Cargo.toml`s,
+  `examples/screenshot.rs`, `examples/wgpu_texture/`, and
+  `blitz-shell`'s `window.rs`/`event.rs`/`application.rs`), the
+  DioxusLabs/anyrender repo (`anyrender_vello`'s image/window renderers,
+  `wgpu_context/src/lib.rs`), linebender/vello (workspace `Cargo.toml`,
+  README, issue search), gfx-rs/wgpu (`wgpu/Cargo.toml` features,
+  `src/api/surface.rs` `SurfaceTarget`), and rust-windowing/winit
+  (`winit-appkit/src/event_loop.rs`).
 
 ## Updating this plan
 
 When milestone 1 lands, replace the effort estimates and open questions
-in §7 with measured numbers, record the binary-size delta, and decide
+in §8 with measured numbers, record the binary-size delta, and decide
 C1 vs C2 based on whether the matc/WGSL path for our own materials
-worked. If we abandon WebGPU, note why here — the same seam makes the
-next backend swap just as cheap.
+worked. When §6's milestones B1–B2 land, record the Blitz render time,
+the copy cost, and whether the CPU renderer held 60 Hz — that number
+decides B4 (wgpu renderer) and closes §6.6's first three questions. If
+we abandon WebGPU, note why here — the same seam makes the next backend
+swap just as cheap.
