@@ -242,6 +242,14 @@ class StatsHud {
 
   static const _pad = 2;
 
+  /// Tracks a window resize. The canvas keeps the size it was created
+  /// with — text scales with the viewport instead of re-flowing, which is
+  /// fine for an overlay.
+  Future<void> resize(int width, int height) async {
+    if (width <= 0 || height <= 0) return;
+    await view.setViewport(width, height);
+  }
+
   /// Shows or hides the HUD. A hidden HUD uploads nothing, so it costs
   /// nothing per frame while dismissed.
   Future<void> setVisible(bool value) async {

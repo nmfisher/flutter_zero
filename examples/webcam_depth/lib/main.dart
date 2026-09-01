@@ -183,6 +183,7 @@ Future<int> runApp(
       }
       if (event is SdlxWindowEvent && event.type == SDL_EVENT_WINDOW_RESIZED) {
         await video.resize(event.data1, event.data2);
+        await hud.resize(event.data1, event.data2);
       }
     }
 
